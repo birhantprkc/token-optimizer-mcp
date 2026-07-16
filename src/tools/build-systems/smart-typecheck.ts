@@ -112,6 +112,7 @@ export class SmartTypeCheck {
   private cache: CacheEngine;
   private cacheNamespace = 'smart_typecheck';
   private projectRoot: string;
+  private readonly defaultProjectRoot: string;
 
   constructor(
     cache: CacheEngine,
@@ -120,7 +121,8 @@ export class SmartTypeCheck {
     projectRoot?: string
   ) {
     this.cache = cache;
-    this.projectRoot = projectRoot || process.cwd();
+    this.defaultProjectRoot = projectRoot || process.cwd();
+    this.projectRoot = this.defaultProjectRoot;
   }
 
   /**
@@ -129,6 +131,13 @@ export class SmartTypeCheck {
   async run(
     options: SmartTypeCheckOptions = {}
   ): Promise<SmartTypeCheckOutput> {
+    // Honor a per-call projectRoot. The MCP server constructs this tool ONCE
+    // as a singleton (with the server's own cwd), so without this the
+    // projectRoot argument was silently ignored and tsc ran in the wrong
+    // directory — reporting success:false with 0 files on a clean project.
+    // Resolve from the constructor default each call so omitting projectRoot
+    // reverts to the default instead of stickily keeping a prior call's value.
+    this.projectRoot = options.projectRoot || this.defaultProjectRoot;
     const {
       force = false,
       watch = false,
@@ -191,7 +200,9 @@ export class SmartTypeCheck {
       // SECURITY: argv mode (shell:false) so caller-controlled args are passed
       // verbatim and cannot be reinterpreted by a shell.
       const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-      const tsc = spawn(npx, ['tsc', ...args], {
+      // --no-install: use only a locally/globally installed tsc rather than
+      // letting npx silently download typescript from the registry.
+      const tsc = spawn(npx, ['--no-install', 'tsc', ...args], {
         cwd: this.projectRoot,
         shell: false,
         windowsHide: true,

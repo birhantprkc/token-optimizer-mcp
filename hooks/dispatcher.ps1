@@ -5,9 +5,13 @@
 [CmdletBinding()]
 param([string]$Phase = "")
 
-$HANDLERS_DIR = "C:\Users\cheat\.claude-global\hooks\handlers"
-$LOG_FILE = "C:\Users\cheat\.claude-global\hooks\logs\dispatcher.log"
-$ORCHESTRATOR = "$HANDLERS_DIR\token-optimizer-orchestrator.ps1"
+# Resolve every path relative to THIS script so the hooks work for any user
+# and any install location. NEVER hardcode a developer profile — that breaks
+# the hooks for everyone but the original dev machine. dispatcher.ps1 lives
+# at the hooks root, so $PSScriptRoot is the hooks root.
+$HANDLERS_DIR = Join-Path $PSScriptRoot "handlers"
+$LOG_FILE = Join-Path $PSScriptRoot "logs\dispatcher.log"
+$ORCHESTRATOR = Join-Path $HANDLERS_DIR "token-optimizer-orchestrator.ps1"
 
 # Load the shared logging helper defensively: a missing/malformed helper
 # must not kill the dispatcher for every hook phase. Fall back to a
@@ -71,16 +75,32 @@ try {
     # ============================================================
     if ($Phase -eq "PreToolUse") {
 
-        # 1. SMART READ - Use smart_read MCP tool for cached file reads (CRITICAL FOR TOKEN SAVINGS!)
-        # This replaces plain Read with intelligent caching, diffing, and truncation
-        # Must run BEFORE user enforcers to ensure caching takes priority
-        if ($toolName -eq "Read") {
-            & powershell -NoProfile -ExecutionPolicy Bypass -File $ORCHESTRATOR -Phase "PreToolUse" -Action "smart-read" -InputJsonFile $tempFile
-            if ($LASTEXITCODE -eq 2) {
-                # smart_read succeeded - blocks plain Read and returns cached/optimized content
-                exit 2
+        # NOTE: transparent smart_read substitution for the BUILT-IN Read tool
+        # is impossible — PreToolUse cannot replace output, and PostToolUse
+        # `updatedToolOutput` is ignored for built-in tools
+        # (anthropics/claude-code#32105). Transparent substitution only works
+        # for the MCP file-read tools (handled in PostToolUse below).
+
+        # 1. OPT-IN large-Read redirect (built-in Read only, OFF by default).
+        #    Since we cannot compress a built-in Read's output, the next best
+        #    thing is to steer big reads to the smart_read MCP tool, whose
+        #    output IS compressed (cached/diffed/truncated). Enable by setting
+        #    TOKEN_OPTIMIZER_REDIRECT_LARGE_READS=true. Off by default so it
+        #    never disrupts normal edit workflows.
+        if ($toolName -eq "Read" -and $env:TOKEN_OPTIMIZER_REDIRECT_LARGE_READS -eq 'true') {
+            $readPath = $data.tool_input.file_path
+            if ($readPath -and (Test-Path -LiteralPath $readPath -PathType Leaf)) {
+                # Threshold in bytes (default 51200 = 50KB); configurable.
+                $thresholdBytes = 51200
+                if ($env:TOKEN_OPTIMIZER_LARGE_READ_BYTES) {
+                    [int]::TryParse($env:TOKEN_OPTIMIZER_LARGE_READ_BYTES, [ref]$thresholdBytes) | Out-Null
+                }
+                $sizeBytes = (Get-Item -LiteralPath $readPath).Length
+                if ($sizeBytes -ge $thresholdBytes) {
+                    Write-Log "[REDIRECT] Large Read ($sizeBytes bytes) -> smart_read: $readPath"
+                    Block-Tool -Reason "This file is large ($([Math]::Round($sizeBytes/1KB)) KB). Use the smart_read MCP tool (smart_read with path='$readPath') for a token-optimized, cached/diffed read instead of the built-in Read."
+                }
             }
-            # If smart_read failed, allow plain Read to proceed
         }
 
         # 2. Context Guard - Check if we're approaching token limit
@@ -163,6 +183,39 @@ try {
     # ============================================================
     if ($Phase -eq "PostToolUse") {
         $phaseStart = Get-Date
+
+        # 0. SMART READ SUBSTITUTION (MCP file-read tools ONLY)
+        #    Claude Code's `updatedToolOutput` does NOT work for BUILT-IN tools
+        #    like Read (anthropics/claude-code#32105 — closed, not implemented);
+        #    only `updatedMCPToolOutput` works, and only for MCP tools. So the
+        #    one place we can transparently swap in compressed content is the
+        #    MCP filesystem read tools. Built-in Read cannot be substituted —
+        #    it is handled (opt-in) at PreToolUse, and users can always call the
+        #    smart_read MCP tool directly for compressed reads.
+        if ($toolName -in @("mcp__filesystem__read_file", "mcp__filesystem__read_text_file")) {
+            $smartReadOutput = & powershell -NoProfile -ExecutionPolicy Bypass -File $ORCHESTRATOR -Phase "PostToolUse" -Action "smart-read" -InputJsonFile $tempFile
+            $smartReadExit = $LASTEXITCODE
+            if ($smartReadExit -eq 2 -and $smartReadOutput) {
+                # Still record the operation for session analytics. Suppress any
+                # stdout from these so it can't corrupt the JSON we relay.
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $ORCHESTRATOR -Phase "PostToolUse" -Action "log-operation" -InputJsonFile $tempFile | Out-Null
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $ORCHESTRATOR -Phase "PostToolUse" -Action "session-track" -InputJsonFile $tempFile | Out-Null
+
+                # Relay the orchestrator's updatedMCPToolOutput JSON verbatim and
+                # exit 0 — PostToolUse only parses stdout JSON on exit 0 (exit 2
+                # would merely surface stderr and cannot substitute output).
+                [Console]::Out.Write(($smartReadOutput -join "`n"))
+                [Console]::Out.Flush()
+
+                if (Test-Path $tempFile) {
+                    Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
+                }
+                Write-Log "[SMART-READ] Substituted MCP file-read output via updatedMCPToolOutput"
+                exit 0
+            }
+            # smart_read miss/failure: fall through to normal handling so the
+            # original result is preserved and still logged/optimized.
+        }
 
         # 1. Log ALL tool operations to operations-{sessionId}.csv
         #    This is CRITICAL for session-level optimization

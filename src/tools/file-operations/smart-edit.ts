@@ -120,6 +120,16 @@ export class SmartEditTool {
       const originalLines = originalContent.split('\n');
       const originalTokens = this.tokenCounter.count(originalContent).tokens;
 
+      // Small-file guard: for tiny files the unified-diff + metadata payload
+      // costs MORE tokens than it saves, making smart_edit net-negative (a
+      // 6-line edit reported tokensSaved: -130). Mirror the compression
+      // MIN_SIZE_THRESHOLD (500 bytes): below it, don't return the diff so the
+      // response stays minimal. The edit itself is still applied normally.
+      const SMALL_FILE_BYTES = 500;
+      const isSmallFile =
+        Buffer.byteLength(originalContent, opts.encoding) < SMALL_FILE_BYTES;
+      const effectiveReturnDiff = opts.returnDiff && !isSmallFile;
+
       // Normalize operations to array
       const ops = Array.isArray(operations) ? operations : [operations];
 
@@ -133,6 +143,9 @@ export class SmartEditTool {
       // Check if content actually changed
       if (editedContent === originalContent) {
         const duration = Date.now() - startTime;
+        // Clamp so a tiny unchanged file (< 50 tokens) never reports a
+        // misleading negative saving.
+        const unchangedSaved = Math.max(0, originalTokens - 50);
 
         this.metrics.record({
           operation: 'smart_edit',
@@ -140,7 +153,7 @@ export class SmartEditTool {
           inputTokens: 50, // Minimal tokens for "no changes" message
           outputTokens: 0,
           cachedTokens: 0,
-          savedTokens: originalTokens - 50,
+          savedTokens: unchangedSaved,
           success: true,
           cacheHit: false,
         });
@@ -154,7 +167,7 @@ export class SmartEditTool {
             linesChanged: 0,
             originalLines: originalLines.length,
             finalLines: editedLines.length,
-            tokensSaved: originalTokens - 50,
+            tokensSaved: unchangedSaved,
             tokenCount: 50,
             originalTokenCount: originalTokens,
             compressionRatio: 50 / originalTokens,
@@ -172,17 +185,19 @@ export class SmartEditTool {
         filePath,
         opts.contextLines
       );
-      const diffTokens = opts.returnDiff
+      const diffTokens = effectiveReturnDiff
         ? this.tokenCounter.count(diff.unifiedDiff).tokens
         : this.tokenCounter.count(editedContent).tokens;
 
       // If dry run, return preview without applying
       if (opts.dryRun) {
         const duration = Date.now() - startTime;
-        const tokensSaved =
+        const tokensSaved = Math.max(
+          0,
           originalTokens +
-          this.tokenCounter.count(editedContent).tokens -
-          diffTokens;
+            this.tokenCounter.count(editedContent).tokens -
+            diffTokens
+        );
 
         this.metrics.record({
           operation: 'smart_edit',
@@ -212,7 +227,7 @@ export class SmartEditTool {
             verified: opts.verifyBeforeApply,
             wasBackedUp: false,
           },
-          diff: opts.returnDiff ? diff : undefined,
+          diff: effectiveReturnDiff ? diff : undefined,
           preview: editedContent,
         };
       }
@@ -235,7 +250,8 @@ export class SmartEditTool {
 
       // Record metrics
       const duration = Date.now() - startTime;
-      const tokensSaved = originalTokens - diffTokens;
+      // Clamp so a small/expensive edit never reports a misleading negative.
+      const tokensSaved = Math.max(0, originalTokens - diffTokens);
 
       this.metrics.record({
         operation: 'smart_edit',
@@ -265,7 +281,7 @@ export class SmartEditTool {
           verified: opts.verifyBeforeApply,
           wasBackedUp: opts.createBackup,
         },
-        diff: opts.returnDiff ? diff : undefined,
+        diff: effectiveReturnDiff ? diff : undefined,
       };
     } catch (error) {
       const duration = Date.now() - startTime;

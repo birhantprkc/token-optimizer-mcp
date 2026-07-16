@@ -134,6 +134,7 @@ export class SmartTest {
   private cache: CacheEngine;
   private cacheNamespace = 'smart_test';
   private projectRoot: string;
+  private readonly defaultProjectRoot: string;
 
   constructor(
     cache: CacheEngine,
@@ -142,13 +143,21 @@ export class SmartTest {
     projectRoot?: string
   ) {
     this.cache = cache;
-    this.projectRoot = projectRoot || process.cwd();
+    this.defaultProjectRoot = projectRoot || process.cwd();
+    this.projectRoot = this.defaultProjectRoot;
   }
 
   /**
    * Run tests with smart caching and output reduction
    */
   async run(options: SmartTestOptions = {}): Promise<SmartTestOutput> {
+    // Honor a per-call projectRoot. The MCP server constructs this tool ONCE
+    // as a singleton (with the server's own cwd), so without this the
+    // projectRoot argument was silently ignored and npm ran in an unrelated
+    // directory — failing with ENOENT instead of running the project's tests.
+    // Resolve from the constructor default each call so omitting projectRoot
+    // reverts to the default instead of stickily keeping a prior call's value.
+    this.projectRoot = options.projectRoot || this.defaultProjectRoot;
     const {
       pattern,
       onlyChanged = false,

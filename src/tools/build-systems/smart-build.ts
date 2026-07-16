@@ -119,6 +119,7 @@ export class SmartBuild {
   private cache: CacheEngine;
   private cacheNamespace = 'smart_build';
   private projectRoot: string;
+  private readonly defaultProjectRoot: string;
 
   constructor(
     cache: CacheEngine,
@@ -127,13 +128,21 @@ export class SmartBuild {
     projectRoot?: string
   ) {
     this.cache = cache;
-    this.projectRoot = projectRoot || process.cwd();
+    this.defaultProjectRoot = projectRoot || process.cwd();
+    this.projectRoot = this.defaultProjectRoot;
   }
 
   /**
    * Run build with smart caching and output reduction
    */
   async run(options: SmartBuildOptions = {}): Promise<SmartBuildOutput> {
+    // Honor a per-call projectRoot. The MCP server constructs this tool ONCE
+    // as a singleton (with the server's own cwd), so without this the
+    // projectRoot argument was silently ignored and the build ran in the
+    // wrong directory — reporting success:false with 0 files on a clean build.
+    // Resolve from the constructor default each call so omitting projectRoot
+    // reverts to the default instead of stickily keeping a prior call's value.
+    this.projectRoot = options.projectRoot || this.defaultProjectRoot;
     const {
       force = false,
       watch = false,
@@ -211,7 +220,9 @@ export class SmartBuild {
       // tsconfig path) cannot be reinterpreted by a shell. On Windows npx is a
       // .cmd shim that must be named explicitly when not using a shell.
       const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-      const tsc = spawn(npx, ['tsc', ...args], {
+      // --no-install: use only a locally/globally installed tsc rather than
+      // letting npx silently download typescript from the registry.
+      const tsc = spawn(npx, ['--no-install', 'tsc', ...args], {
         cwd: this.projectRoot,
         shell: false,
         windowsHide: true,

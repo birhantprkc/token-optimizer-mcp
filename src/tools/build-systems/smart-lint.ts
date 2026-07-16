@@ -152,6 +152,7 @@ export class SmartLint {
   private cache: CacheEngine;
   private cacheNamespace = 'smart_lint';
   private projectRoot: string;
+  private readonly defaultProjectRoot: string;
   private ignoredIssuesKey = 'ignored_issues';
 
   constructor(
@@ -161,13 +162,21 @@ export class SmartLint {
     projectRoot?: string
   ) {
     this.cache = cache;
-    this.projectRoot = projectRoot || process.cwd();
+    this.defaultProjectRoot = projectRoot || process.cwd();
+    this.projectRoot = this.defaultProjectRoot;
   }
 
   /**
    * Run lint with smart caching and output reduction
    */
   async run(options: SmartLintOptions = {}): Promise<SmartLintOutput> {
+    // Honor a per-call projectRoot. The MCP server constructs this tool ONCE
+    // as a singleton (with the server's own cwd), so without this the
+    // projectRoot argument was silently ignored and eslint ran in the wrong
+    // directory (where it isn't installed, triggering an npx auto-download).
+    // Resolve from the constructor default each call so omitting projectRoot
+    // reverts to the default instead of stickily keeping a prior call's value.
+    this.projectRoot = options.projectRoot || this.defaultProjectRoot;
     const {
       files = 'src',
       force = false,
@@ -222,7 +231,11 @@ export class SmartLint {
       // SECURITY: argv mode (shell:false) so caller-controlled file paths are
       // passed verbatim to eslint and cannot be reinterpreted by a shell.
       const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-      const eslint = spawn(npx, ['eslint', ...args], {
+      // --no-install: use only a locally/globally installed eslint. Without it,
+      // npx SILENTLY DOWNLOADS eslint from the registry when it isn't found —
+      // an unexpected network install the user never asked for. Now it fails
+      // cleanly instead, and the caller can install eslint deliberately.
+      const eslint = spawn(npx, ['--no-install', 'eslint', ...args], {
         cwd: this.projectRoot,
         shell: false,
         windowsHide: true,
