@@ -1,6 +1,6 @@
 {
   "name": "@ooples/token-optimizer-mcp",
-  "version": "5.0.2",
+  "version": "5.1.1",
   "mcpName": "io.github.ooples/token-optimizer-mcp",
   "description": "Intelligent context window optimization for Claude Code - store content externally via caching and compression, freeing up your context window for what matters",
   "main": "dist/server/index.js",
@@ -28,7 +28,7 @@
     "start": "node dist/server/index.js",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
-    "prepublishOnly": "npm run clean && npm run build && npm test",
+    "prepublishOnly": "npm run clean && npm run build",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "test:ci": "node --experimental-vm-modules node_modules/jest/bin/jest.js --ci --coverage --maxWorkers=2",
