@@ -876,10 +876,10 @@ export async function runSmartCacheApi(
   const { homedir } = await import('os');
   const { join } = await import('path');
   const { CacheEngine: CacheEngineClass } = await import(
-    '../../core/cache-engine'
+    '../../core/cache-engine.js'
   );
-  const { TokenCounter } = await import('../../core/token-counter');
-  const { MetricsCollector } = await import('../../core/metrics');
+  const { TokenCounter } = await import('../../core/token-counter.js');
+  const { MetricsCollector } = await import('../../core/metrics.js');
 
   const cache = new CacheEngineClass(
     join(homedir(), '.hypercontext', 'cache'),
@@ -897,7 +897,7 @@ export async function runSmartCacheApi(
  * MCP Tool Definition
  */
 export const SMART_CACHE_API_TOOL_DEFINITION = {
-  name: 'smart-cache-api',
+  name: 'smart_cache_api',
   description: `API Response Caching with 83% token reduction through intelligent cache management.
 
 Features:
@@ -941,6 +941,8 @@ Token Reduction:
           body: { type: 'object' },
           params: { type: 'object' },
         },
+        // APIRequest requires a url; everything else is optional.
+        required: ['url'],
       },
       response: {
         description: 'API response data (for set)',
@@ -997,6 +999,19 @@ Token Reduction:
         type: 'array',
         items: { type: 'string' },
         description: 'Headers to exclude from cache key',
+      },
+      // DECLARED BECAUSE THEY ARE ACCEPTED: the server spreads the caller's whole
+      // argument object into options, so these worked while being undiscoverable.
+      since: {
+        type: 'string',
+        format: 'date-time',
+        description:
+          'Only entries created or updated after this ISO-8601 timestamp',
+      },
+      includeDetails: {
+        type: 'boolean',
+        description: 'Include per-entry detail rather than totals only',
+        default: false,
       },
     },
     required: ['action'],

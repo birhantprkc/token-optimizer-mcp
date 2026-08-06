@@ -1,0 +1,484 @@
+/*
+ * What it knows.
+ *
+ * Draws entirely from tokens.css, so this page and the overview are one
+ * product rather than two tools that happen to share a port. Nothing here
+ * redefines a colour, a radius or a font.
+ *
+ * The graph keeps its own cool hue family (--graph) precisely because it is
+ * NOT a quantity: a node must never read as a savings figure.
+ */
+
+/* ---------------------------------------------------------------- intro -- */
+
+.intro {
+  margin-bottom: 26px;
+  max-width: 68ch;
+}
+
+.intro h1 {
+  font-size: clamp(23px, 3.4vw, 31px);
+  font-weight: 680;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+  margin: 0 0 10px;
+  text-wrap: balance;
+}
+
+.intro p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 14.5px;
+  line-height: 1.62;
+}
+
+/* -------------------------------------------------------------- balance -- */
+
+.wiki-balance {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: var(--gap);
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px;
+  margin: 14px 0 4px;
+}
+
+.stat-card {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 13px 15px;
+}
+
+.stat-label {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  margin-bottom: 5px;
+}
+
+.stat-value {
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The verdict, in words, with its state carried by more than colour. */
+.verdict-line {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  font-size: 14.5px;
+  font-weight: 600;
+  margin: 14px 0 0;
+}
+
+.verdict-line::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ink-3);
+  flex: none;
+}
+
+.verdict-line[data-state='ok'] {
+  color: var(--ok);
+}
+.verdict-line[data-state='ok']::before {
+  background: var(--ok);
+  box-shadow: 0 0 10px var(--saved-glow);
+}
+
+.verdict-line[data-state='warn'],
+.verdict-line[data-state='insufficient'] {
+  color: var(--warn);
+}
+.verdict-line[data-state='warn']::before,
+.verdict-line[data-state='insufficient']::before {
+  background: var(--warn);
+}
+
+.verdict-line[data-state='bad'] {
+  color: var(--bad);
+}
+.verdict-line[data-state='bad']::before {
+  background: var(--bad);
+}
+
+.method-line {
+  color: var(--ink-3);
+  font-size: 12.5px;
+  margin: 7px 0 0;
+  line-height: 1.55;
+}
+
+/* ----------------------------------------------------------------- tabs -- */
+
+.wiki-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: var(--gap);
+  border-bottom: 1px solid var(--line);
+}
+
+.wiki-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--ink-3);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 9px 14px;
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+
+.wiki-tab:hover {
+  color: var(--ink);
+}
+
+.wiki-tab.is-active {
+  color: var(--ink);
+  border-bottom-color: var(--saved);
+}
+
+.panel-intro {
+  max-width: 70ch;
+  margin: 0 0 18px;
+  line-height: 1.6;
+}
+
+/* ------------------------------------------------------------- controls -- */
+
+.wiki-controls {
+  display: flex;
+  gap: 14px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.ctl-label {
+  display: block;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  margin-bottom: 5px;
+}
+
+.ctl-search {
+  flex: 1;
+  min-width: 220px;
+}
+
+#wiki-search,
+#wiki-type {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 14px;
+  padding: 9px 12px;
+}
+
+#wiki-search:focus,
+#wiki-type:focus {
+  outline: 2px solid var(--saved);
+  outline-offset: 1px;
+  border-color: transparent;
+}
+
+.wiki-modes {
+  display: flex;
+  gap: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px;
+}
+
+.wiki-mode {
+  background: none;
+  border: none;
+  border-radius: 999px;
+  color: var(--ink-3);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 550;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+.wiki-mode.is-active {
+  background: var(--surface-3);
+  color: var(--ink);
+}
+
+/* ---------------------------------------------------------------- split -- */
+
+.wiki-split {
+  display: grid;
+  grid-template-columns: minmax(0, 400px) 1fr;
+  gap: var(--gap);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .wiki-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.wiki-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  max-height: 560px;
+  overflow-y: auto;
+}
+
+.wiki-list li {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  cursor: pointer;
+}
+
+.wiki-list li:hover {
+  border-color: var(--line-bright);
+  background: var(--surface-2);
+}
+
+.wiki-list li[aria-current='true'] {
+  border-color: var(--saved);
+  background: var(--surface-2);
+}
+
+.wiki-claim {
+  font-size: 13.5px;
+  line-height: 1.5;
+  margin-bottom: 7px;
+}
+
+.wiki-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.wiki-tag {
+  background: var(--surface-3);
+  border-radius: 999px;
+  color: var(--ink-3);
+  font-size: 11px;
+  padding: 2px 9px;
+}
+
+.wiki-more {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.wiki-muted {
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+
+/* ---------------------------------------------------------------- graph -- */
+
+.wiki-graph-pane {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px;
+  min-height: 420px;
+  display: flex;
+  flex-direction: column;
+}
+
+#wiki-graph {
+  width: 100%;
+  flex: 1;
+  min-height: 320px;
+}
+
+.wiki-node text {
+  font-family: var(--font);
+  font-size: 11px;
+  fill: var(--ink-2);
+}
+
+.wiki-edge {
+  stroke: var(--line-bright);
+  stroke-width: 1;
+}
+
+.wiki-edge-label {
+  font-size: 10px;
+  fill: var(--ink-3);
+}
+
+.wiki-graph-hint {
+  margin: 10px 0 0;
+}
+
+.wiki-legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 12px 0 0;
+  padding: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.wiki-legend li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.wiki-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--graph);
+}
+
+.wiki-swatch[data-kind='symbol'] {
+  background: var(--graph-2);
+}
+.wiki-swatch[data-kind='finding'] {
+  background: var(--saved);
+}
+.wiki-swatch[data-kind='task'] {
+  background: var(--spent);
+}
+
+.graph-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.gs-value {
+  display: block;
+  font-size: 18px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.gs-label {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+
+/* --------------------------------------------------------------- audit -- */
+
+#audit-groups {
+  display: grid;
+  gap: 14px;
+}
+
+#audit-groups > * {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.wiki-diff {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 11px 13px;
+  margin-top: 10px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.wiki-figure {
+  margin: 0;
+}
+
+/* -------------------------------------------------------------- drawer -- */
+
+.wiki-detail {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(460px, 92vw);
+  background: var(--surface);
+  border-left: 1px solid var(--line-bright);
+  box-shadow: -18px 0 44px rgba(0, 0, 0, 0.42);
+  padding: 26px;
+  overflow-y: auto;
+  z-index: 60;
+}
+
+body.wiki-detail-open {
+  overflow: hidden;
+}
+
+/*
+ * RESERVE THE PANEL'S SPACE WHILE IT IS OPEN.
+ *
+ * `.wiki-detail` is `position: fixed; right: 0` at z-index 60, so it is outside
+ * the flow and overlays whatever sits beneath it. Nothing reserved room for it,
+ * so at ordinary viewport widths an open panel covered the right-hand end of the
+ * content -- both list rows and the graph-mode buttons in the toolbar above them --
+ * and none of it could be clicked; the pointer landed on the panel instead.
+ *
+ * Caught by verify:ui, which had never run in CI: a click on a list item timed
+ * out with 'div#wiki-detail intercepts pointer events' after the panel opened --
+ * the button it could not reach was #mode-constellation, in the toolbar.
+ * That is a usability bug, not a test artefact -- a real user with the panel
+ * open cannot reach those rows either.
+ *
+ * Applied to `main` rather than the list pane because the toolbar is a sibling of
+ * the list, not a child -- shifting only the list left the buttons underneath.
+ * Margin rather than padding so backgrounds do not extend under the panel, and
+ * the same `min()` as the panel's width so the two cannot disagree.
+ */
+body.wiki-detail-open main {
+  margin-right: min(460px, 92vw);
+}
+
+.wiki-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.wiki-actions .btn {
+  font-size: 13px;
+}
+
+#detail-claim {
+  font-size: 15.5px;
+  line-height: 1.55;
+  margin-bottom: 12px;
+}

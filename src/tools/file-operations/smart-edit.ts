@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Smart Edit Tool - 90% Token Reduction
  *
  * Achieves token reduction through:
@@ -15,10 +15,33 @@ import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { CacheEngine } from '../../core/cache-engine.js';
+import { bumpFsGeneration } from '../../utils/fs-generation.js';
+import { writeBackup } from '../../utils/file-backup.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import { MetricsCollector } from '../../core/metrics.js';
 import { generateCacheKey } from '../shared/hash-utils.js';
 import { generateUnifiedDiff } from '../shared/diff-utils.js';
+
+// Backups live in utils/file-backup.ts, shared with smart_write. They were
+// implemented here only, so smart_write went on writing `<file>.bak` into the
+// user's working tree long after the defect was understood and fixed here.
+// Re-exported because tests and callers already import BACKUP_ROOT from this
+// module.
+export { BACKUP_ROOT } from '../../utils/file-backup.js';
+
+/**
+ * The line ending a file actually uses, so an edit can put back what it found.
+ *
+ * Dominance rather than first-match: a file with one stray ending should not
+ * have the whole file rewritten to match the stray. A file with no newline at
+ * all gets '\n', which is what a new line in a one-line file should be.
+ */
+
+function detectLineEnding(text: string): string {
+  const crlf = (text.match(/\r\n/g) || []).length;
+  const lf = (text.match(/\n/g) || []).length - crlf;
+  return crlf > lf ? '\r\n' : '\n';
+}
 
 export interface EditOperation {
   type: 'replace' | 'insert' | 'delete';
@@ -35,7 +58,9 @@ export interface SmartEditOptions {
   dryRun?: boolean; // Preview changes without applying (default: false)
 
   // Backup options
-  createBackup?: boolean; // Create .bak file before editing (default: true)
+  // Save the pre-edit content before writing (default: true). Backups go to
+  // ~/.token-optimizer/backups, NOT next to the file -- see writeBackup.
+  createBackup?: boolean;
 
   // Multi-edit options
   batchEdits?: boolean; // Apply all edits atomically (default: true)
@@ -117,7 +142,38 @@ export class SmartEditTool {
 
       // Read original content
       const originalContent = readFileSync(filePath, opts.encoding);
-      const originalLines = originalContent.split('\n');
+      // SPLIT ON EITHER ENDING, AND PUT BACK THE ONE THE FILE USES.
+      //
+      // `split('\n')` leaves a trailing '\r' on every line of a CRLF file, so
+      // the lines an edit did NOT touch kept their '\r' and the lines it
+      // replaced did not. `join('\n')` then wrote a file with mixed endings --
+      // measured on Windows, where every source file is CRLF: a one-line
+      // replace in a 5-line file turned 4 CRLF into 3 CRLF + 1 bare LF.
+      //
+      // Nothing errors, so it is invisible until git reports the line as
+      // changed, an editor warns about mixed endings, or a .gitattributes
+      // check fails -- and it compounds with every subsequent edit.
+      const eol = detectLineEnding(originalContent);
+      const originalLines = originalContent.split(/\r?\n/);
+      // THE REAL LINE COUNT, which is not `originalLines.length`.
+      //
+      // Splitting content that ends with a newline leaves a trailing empty
+      // element -- a 10-line file yields 11 -- and that number was both reported
+      // to the caller and used to validate their operations. So the tool
+      // advertised a line that does not exist and then accepted a `replace`
+      // against it: measured, that returned success with verified: true,
+      // appended the content, and destroyed the file's trailing newline.
+      //
+      // The split array itself is left alone: the edit machinery rebuilds the
+      // content by joining it, and dropping the element would silently strip
+      // the trailing newline from every file it touches.
+      const countLines = (text: string): number => {
+        const parts = text.split(/\r?\n/);
+        const trailing =
+          text.length > 0 && text.charCodeAt(text.length - 1) === 10;
+        return trailing ? Math.max(0, parts.length - 1) : parts.length;
+      };
+      const lineCount = countLines(originalContent);
       const originalTokens = this.tokenCounter.count(originalContent).tokens;
 
       // Small-file guard: for tiny files the unified-diff + metadata payload
@@ -134,11 +190,33 @@ export class SmartEditTool {
       const ops = Array.isArray(operations) ? operations : [operations];
 
       // Validate operations
-      this.validateOperations(ops, originalLines.length);
+      this.validateOperations(ops, lineCount);
 
       // Apply edits
-      const editedLines = this.applyEdits(originalLines, ops);
-      const editedContent = editedLines.join('\n');
+      const { lines: editedLines, applied } = this.applyEdits(
+        originalLines,
+        ops
+      );
+      // Caller-supplied content may be multi-line and will use whatever ending
+      // the caller happened to type, so each line is re-normalised before the
+      // whole file is joined with the ending it actually uses.
+      const editedContent = editedLines
+        .map((line) => line.split(/\r?\n/).join(eol))
+        .join(eol);
+
+      // THE SAME RULE ON BOTH SIDES OF THE REPORT.
+      //
+      // `originalLines` counts logical lines, so `finalLines` must too.
+      // `editedLines.length` counts array elements, which still include the
+      // trailing empty one, so an ordinary edit to a ten-line file reported
+      // `originalLines: 10, finalLines: 11` -- a caller reading those two numbers
+      // sees a line appear out of an edit that added none, and the metadata is
+      // the only thing it has to go on, because the file contents are exactly
+      // what smart_edit exists not to return.
+      //
+      // Derived from the CONTENT rather than the array for the same reason the
+      // original count is: the array is a join artefact, the content is the file.
+      const finalLines = countLines(editedContent);
 
       // Check if content actually changed
       if (editedContent === originalContent) {
@@ -147,6 +225,13 @@ export class SmartEditTool {
         // misleading negative saving.
         const unchangedSaved = Math.max(0, originalTokens - 50);
 
+        // Decided ONCE and reused by both the metrics record and the returned
+        // result. Computing it twice let the two disagree: the metrics call
+        // still recorded success: true for a run the caller was told had
+        // failed, so the very failure this change surfaces would have been
+        // invisible in the tool's own analytics.
+        const unchangedIsSuccess = ops.length === 0 || applied > 0;
+
         this.metrics.record({
           operation: 'smart_edit',
           duration,
@@ -154,19 +239,30 @@ export class SmartEditTool {
           outputTokens: 0,
           cachedTokens: 0,
           savedTokens: unchangedSaved,
-          success: true,
+          success: unchangedIsSuccess,
           cacheHit: false,
         });
 
         return {
-          success: true,
+          // NOT unconditionally true. "The content is identical" has two very
+          // different causes: every operation ran and happened to reproduce what
+          // was already there (a genuine no-op, success), or NOTHING ran at all
+          // (a failure the caller must see). Reporting both as success with
+          // editsApplied: 0 made a silently-dropped edit indistinguishable from
+          // an idempotent one -- observed live, where a two-operation call
+          // returned success with the file untouched and no error anywhere.
+          success: unchangedIsSuccess,
           path: filePath,
           operation: 'unchanged',
+          error:
+            ops.length > 0 && applied === 0
+              ? `none of the ${ops.length} requested operation(s) were applied and the file is unchanged`
+              : undefined,
           metadata: {
-            editsApplied: 0,
+            editsApplied: applied,
             linesChanged: 0,
-            originalLines: originalLines.length,
-            finalLines: editedLines.length,
+            originalLines: lineCount,
+            finalLines,
             tokensSaved: unchangedSaved,
             tokenCount: 50,
             originalTokenCount: originalTokens,
@@ -215,10 +311,10 @@ export class SmartEditTool {
           path: filePath,
           operation: 'preview',
           metadata: {
-            editsApplied: ops.length,
+            editsApplied: applied,
             linesChanged: diff.added.length + diff.removed.length,
-            originalLines: originalLines.length,
-            finalLines: editedLines.length,
+            originalLines: lineCount,
+            finalLines,
             tokensSaved,
             tokenCount: diffTokens,
             originalTokenCount: originalTokens,
@@ -232,14 +328,16 @@ export class SmartEditTool {
         };
       }
 
-      // Create backup if requested
-      if (opts.createBackup) {
-        const backupPath = `${filePath}.bak`;
-        writeFileSync(backupPath, originalContent, opts.encoding);
-      }
+      // Create backup if requested, and remember whether it actually happened
+      const backedUp = opts.createBackup
+        ? writeBackup(filePath, originalContent, opts.encoding)
+        : false;
 
       // Apply changes to file
       writeFileSync(filePath, editedContent, opts.encoding);
+      // Tell the search tools the tree moved, so no cached grep or glob
+      // result can describe a state that no longer exists.
+      bumpFsGeneration();
 
       // Update cache
       if (opts.updateCache) {
@@ -269,17 +367,18 @@ export class SmartEditTool {
         path: filePath,
         operation: 'applied',
         metadata: {
-          editsApplied: ops.length,
+          editsApplied: applied,
           linesChanged: diff.added.length + diff.removed.length,
-          originalLines: originalLines.length,
-          finalLines: editedLines.length,
+          originalLines: lineCount,
+          finalLines,
           tokensSaved,
           tokenCount: diffTokens,
           originalTokenCount: originalTokens,
           compressionRatio: diffTokens / originalTokens,
           duration,
           verified: opts.verifyBeforeApply,
-          wasBackedUp: opts.createBackup,
+          // The outcome, not the request. See writeBackup.
+          wasBackedUp: backedUp,
         },
         diff: effectiveReturnDiff ? diff : undefined,
       };
@@ -326,10 +425,52 @@ export class SmartEditTool {
     operations: EditOperation[],
     totalLines: number
   ): void {
+    const KNOWN = new Set(['replace', 'insert', 'delete']);
+
     for (const op of operations) {
-      if (op.startLine < 1 || op.startLine > totalLines + 1) {
+      // A MALFORMED OPERATION IS REFUSED, NOT IGNORED.
+      //
+      // Every check below reads fields off `op`, and `undefined < 1` and
+      // `undefined > 11` are both false -- so an object that is not an operation
+      // at all passed validation untouched, reached `applyEdits`, matched no
+      // branch of its switch, and came back as "unchanged, nothing applied".
+      //
+      // That is not hypothetical. The tests written for this very defect called
+      // `edit(path, { operations: [...] })` when the signature is
+      // `edit(path, operations, options)`, so every one of them handed this
+      // function a single `{ operations: [...] }` object. They passed -- the file
+      // really was untouched and the call really did report failure -- while
+      // exercising none of the behaviour they named. The operations reaching this
+      // tool come from a JSON boundary, so a caller can make the same mistake.
+      if (!op || typeof op !== 'object' || !KNOWN.has(op.type)) {
         throw new Error(
-          `Invalid startLine: ${op.startLine} (file has ${totalLines} lines)`
+          `Invalid operation type: ${JSON.stringify(op?.type)} (expected replace, insert or delete)`
+        );
+      }
+      if (!Number.isInteger(op.startLine)) {
+        throw new Error(
+          `Invalid startLine: ${JSON.stringify(op.startLine)} (expected a 1-based integer line number)`
+        );
+      }
+
+      // ONE PAST THE END IS AN `insert` POSITION, AND ONLY THAT.
+      //
+      // `totalLines + 1` names the point after the last line, which is where an
+      // append goes -- a real and necessary operation. It does not name a line,
+      // so nothing can be replaced or deleted there.
+      //
+      // The array being edited still carries the trailing empty element left by
+      // splitting content that ends with a newline, so `replace` and `delete` at
+      // that index did not fail: they hit the phantom. Measured on a 10-line
+      // file, both returned success with `verified: true` and both stripped the
+      // file's trailing newline -- `replace` by appending its content past the
+      // last line, `delete` by removing the separator itself.
+      const maxStart = op.type === 'insert' ? totalLines + 1 : totalLines;
+      if (op.startLine < 1 || op.startLine > maxStart) {
+        throw new Error(
+          op.type === 'insert'
+            ? `Invalid startLine: ${op.startLine} (file has ${totalLines} lines; insert accepts up to ${maxStart})`
+            : `Invalid startLine: ${op.startLine} (file has ${totalLines} lines; only insert may address line ${totalLines + 1})`
         );
       }
 
@@ -359,13 +500,47 @@ export class SmartEditTool {
   }
 
   /**
-   * Apply edit operations to lines
+   * Apply edit operations to lines.
+   *
+   * TWO DEFECTS LIVED HERE, and they compounded into one another.
+   *
+   * The pattern replace ran per LINE (`result[i].replace(...)`), so any pattern
+   * containing a newline could never match anything -- the text it was written
+   * against did not exist on any single line. The replace is now applied to the
+   * JOINED range, which is what a caller passing a multi-line pattern already
+   * believes is happening.
+   *
+   * And a pattern that matched nothing was silently ignored: the edit returned
+   * success with `editsApplied: 0` and `operation: 'unchanged'`, which is
+   * indistinguishable from "your edit was a legitimate no-op". A caller whose
+   * regex was subtly wrong got told it worked. Unmatched patterns now throw,
+   * which the caller renders as `operation: 'failed'` with the offending
+   * patterns named.
+   *
+   * The throw is deliberately all-or-nothing. If three patterns are supplied
+   * and one misses, applying the other two leaves the file in a state the
+   * caller never asked for and did not expect -- worse than doing nothing.
+   *
+   * Note this is only about PATTERN operations. A line-based edit whose content
+   * happens to equal what was already there is a genuine no-op and still
+   * returns success/unchanged.
    */
-  private applyEdits(lines: string[], operations: EditOperation[]): string[] {
+  private applyEdits(
+    lines: string[],
+    operations: EditOperation[]
+  ): { lines: string[]; applied: number } {
     // Sort operations by line number (descending) to avoid index shifting
     const sortedOps = [...operations].sort((a, b) => b.startLine - a.startLine);
 
-    let result = [...lines];
+    // Only ever mutated through splice, never reassigned.
+    const result = [...lines];
+    const unmatched: string[] = [];
+
+    // How many operations actually EXECUTED, which is not the same as how many
+    // were requested. An operation can decline to run -- a pattern that matches
+    // nothing, a replace with neither pattern nor content -- and the caller has
+    // no way to tell that from a successful edit unless the count is real.
+    let applied = 0;
 
     for (const op of sortedOps) {
       const startIdx = op.startLine - 1; // Convert to 0-based
@@ -374,19 +549,59 @@ export class SmartEditTool {
       switch (op.type) {
         case 'replace':
           if (op.pattern && op.replacement !== undefined) {
-            // Pattern-based replacement
             const pattern =
               typeof op.pattern === 'string'
                 ? new RegExp(op.pattern, 'g')
                 : op.pattern;
 
-            for (let i = startIdx; i <= endIdx && i < result.length; i++) {
-              result[i] = result[i].replace(pattern, op.replacement);
+            const lastIdx = Math.min(endIdx, result.length - 1);
+            if (startIdx < 0 || startIdx > lastIdx) {
+              unmatched.push(String(op.pattern));
+              break;
             }
+
+            // Joined, so a pattern spanning lines can match. Splitting the
+            // result back means a replacement may legitimately change the line
+            // count, which the per-line version could not express either.
+            const target = result.slice(startIdx, lastIdx + 1).join('\n');
+
+            // ASK WHETHER IT MATCHED, don't infer it from the output changing.
+            // Comparing `replaced === target` conflated two different things: a
+            // pattern that never matched, and one that matched but whose
+            // replacement reproduced the same text. Measured: replacing
+            // `const a = 1;` with itself, and a `$1 $2` capture-group rebuild,
+            // both matched and both were reported as "matched nothing" -- so an
+            // idempotent edit failed the whole operation.
+            //
+            // Tested on a fresh regex: a /g pattern carries lastIndex between
+            // calls, so probing with the same object would make the result
+            // depend on what was tested before it.
+            const probe =
+              typeof op.pattern === 'string'
+                ? new RegExp(op.pattern)
+                : new RegExp(
+                    op.pattern.source,
+                    op.pattern.flags.replace('g', '')
+                  );
+
+            if (!probe.test(target)) {
+              unmatched.push(String(op.pattern));
+              break;
+            }
+
+            const replaced = target.replace(pattern, op.replacement);
+
+            result.splice(
+              startIdx,
+              lastIdx - startIdx + 1,
+              ...replaced.split('\n')
+            );
+            applied += 1;
           } else if (op.content !== undefined) {
             // Line replacement
             const newLines = op.content.split('\n');
             result.splice(startIdx, endIdx - startIdx + 1, ...newLines);
+            applied += 1;
           }
           break;
 
@@ -394,16 +609,35 @@ export class SmartEditTool {
           if (op.content !== undefined) {
             const newLines = op.content.split('\n');
             result.splice(startIdx, 0, ...newLines);
+            applied += 1;
           }
           break;
 
-        case 'delete':
-          result.splice(startIdx, endIdx - startIdx + 1);
+        case 'delete': {
+          // COUNT ONLY WHAT WAS ACTUALLY REMOVED. splice past the end of the
+          // array removes nothing and throws nothing, so an out-of-range delete
+          // would otherwise be counted as applied -- reintroducing, for this one
+          // operation, exactly the "it says it worked and nothing happened"
+          // failure this change exists to remove.
+          const removed = result.splice(startIdx, endIdx - startIdx + 1);
+          if (removed.length > 0) {
+            applied += 1;
+          }
           break;
+        }
       }
     }
 
-    return result;
+    if (unmatched.length > 0) {
+      const list = unmatched.map((p) => JSON.stringify(p)).join(', ');
+      throw new Error(
+        `Pattern matched nothing, so no edit was made: ${list}. ` +
+          `The requested line range is searched as a whole, so a pattern may span lines; ` +
+          `check for escaping, or use a line-based edit with \`content\` instead.`
+      );
+    }
+
+    return { lines: result, applied };
   }
 
   /**
@@ -598,6 +832,40 @@ export const SMART_EDIT_TOOL_DEFINITION = {
         type: 'boolean',
         description: 'Create backup before editing',
         default: true,
+      },
+      // DECLARED BECAUSE THEY ARE ACCEPTED: the server spreads the caller's whole
+      // argument object into options, so these worked while being undiscoverable.
+      verifyBeforeApply: {
+        type: 'boolean',
+        description:
+          'Re-read and verify the target lines still match before writing',
+        default: true,
+      },
+      batchEdits: {
+        type: 'boolean',
+        description:
+          'Apply all operations in one pass rather than one at a time',
+        default: true,
+      },
+      contextLines: {
+        type: 'number',
+        description: 'Lines of context around each change in the returned diff',
+        default: 3,
+      },
+      updateCache: {
+        type: 'boolean',
+        description: 'Refresh this file in the read cache after editing',
+        default: true,
+      },
+      ttl: {
+        type: 'number',
+        description: 'Cache lifetime in seconds for the refreshed entry',
+        default: 300,
+      },
+      encoding: {
+        type: 'string',
+        description: 'File encoding used to read and write the file',
+        default: 'utf-8',
       },
     },
     required: ['path', 'operations'],

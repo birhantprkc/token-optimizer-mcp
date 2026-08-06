@@ -21,6 +21,8 @@ import {
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { CacheEngine } from '../../core/cache-engine.js';
+import { bumpFsGeneration } from '../../utils/fs-generation.js';
+import { writeBackup } from '../../utils/file-backup.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import { MetricsCollector } from '../../core/metrics.js';
 import { generateCacheKey } from '../shared/hash-utils.js';
@@ -30,7 +32,9 @@ import { detectFileType } from '../shared/syntax-utils.js';
 export interface SmartWriteOptions {
   // Verification options
   verifyBeforeWrite?: boolean; // Skip write if content identical (default: true)
-  createBackup?: boolean; // Create .bak file before overwrite (default: false)
+  // Save the pre-write content before overwriting (default: false). Backups go
+  // to ~/.token-optimizer/backups, NOT next to the file -- see writeBackup.
+  createBackup?: boolean;
 
   // Atomic operation options
   atomic?: boolean; // Use atomic write with temp file (default: true)
@@ -207,10 +211,16 @@ export class SmartWriteTool {
         }
       }
 
-      // Step 4: Create backup if requested
+      // Step 4: Create backup if requested.
+      //
+      // NOT `${filePath}.bak`. That put the backup inside the user's working
+      // tree -- three stray .bak files were sitting in this repository, one
+      // beside a test fixture and one beside a hook a sync script regenerates,
+      // each untracked and one `git add -A` from being committed. smart_edit
+      // was moved to a home-directory backup root; this call site was missed,
+      // so the same defect kept shipping from a second tool.
       if (opts.createBackup && fileExists) {
-        const backupPath = `${filePath}.bak`;
-        writeFileSync(backupPath, originalContent, opts.encoding);
+        writeBackup(filePath, originalContent, opts.encoding);
       }
 
       // Step 5: Perform atomic write
@@ -336,6 +346,9 @@ export class SmartWriteTool {
     if (!atomic) {
       // Direct write (non-atomic)
       writeFileSync(filePath, content, { encoding, mode });
+      // Tell the search tools the tree moved, so no cached grep or glob
+      // result can describe a state that no longer exists.
+      bumpFsGeneration();
       return Buffer.from(content).length;
     }
 
@@ -351,6 +364,10 @@ export class SmartWriteTool {
 
       // Atomic rename (guaranteed on POSIX, best-effort on Windows)
       renameSync(tempPath, filePath);
+      // Same, for the atomic path -- after the RENAME, which is the
+      // point the file actually changes. Bumping after the temp write
+      // would announce a change that a failed rename never made.
+      bumpFsGeneration();
 
       return Buffer.from(content).length;
     } catch (error) {
@@ -595,6 +612,56 @@ export const SMART_WRITE_TOOL_DEFINITION = {
         type: 'boolean',
         description: 'Return diff instead of full content',
         default: true,
+      },
+      // DECLARED BECAUSE THEY ARE ACCEPTED: the server spreads the caller's whole
+      // argument object into options, so these worked while being undiscoverable.
+      createBackup: {
+        type: 'boolean',
+        description:
+          'Back the file up before overwriting. Backups go to a home-directory root, never beside the file.',
+        default: true,
+      },
+      tempDir: {
+        type: 'string',
+        description:
+          'Directory for the temporary file used by the write-then-rename',
+      },
+      formatType: {
+        type: 'string',
+        enum: ['prettier', 'eslint', 'none'],
+        description: 'Formatter to run on the written content',
+        default: 'none',
+      },
+      trackChanges: {
+        type: 'boolean',
+        description:
+          'Record this write in the change log used by the diff tools',
+        default: false,
+      },
+      updateCache: {
+        type: 'boolean',
+        description: 'Refresh this file in the read cache after writing',
+        default: true,
+      },
+      ttl: {
+        type: 'number',
+        description: 'Cache lifetime in seconds for the refreshed entry',
+        default: 300,
+      },
+      createDirectories: {
+        type: 'boolean',
+        description: 'Create missing parent directories instead of failing',
+        default: true,
+      },
+      encoding: {
+        type: 'string',
+        description: 'File encoding used to write the file',
+        default: 'utf-8',
+      },
+      mode: {
+        type: 'number',
+        description:
+          'POSIX file mode for a newly created file, for example 420 for 0o644',
       },
     },
     required: ['path', 'content'],

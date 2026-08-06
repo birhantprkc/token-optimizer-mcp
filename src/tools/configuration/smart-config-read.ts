@@ -17,7 +17,8 @@ import { CacheEngine } from '../../core/cache-engine.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import { MetricsCollector } from '../../core/metrics.js';
 import { hashFile, generateCacheKey } from '../shared/hash-utils.js';
-import { compress, decompress } from '../shared/compression-utils.js';
+import { compress } from '../shared/compression-utils.js';
+import { readCompressedJson } from '../../utils/cache-helper.js';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -39,7 +40,13 @@ export interface SmartConfigReadOptions {
 
   // Output options
   diffMode?: boolean; // Return only diff if config changed
-  includeMetadata?: boolean;
+  // `includeMetadata` REMOVED. It was never read -- `metadata` is built unconditionally
+  // on every return path -- so the option could not change anything. Declaring it in the
+  // schema would have promised control that does not exist, which is the same class of
+  // untruth as an undeclared option, pointing the other way; and honouring it would mean
+  // making `metadata` optional on the result type, a breaking change for every consumer
+  // in service of an option nobody could have been using. Nothing in the repository
+  // passed it.
   includeSuggestions?: boolean;
   validateOnly?: boolean; // Only validate, don't return full config
 
@@ -204,11 +211,19 @@ export class SmartConfigReadTool {
       inferredSchema = this.inferSchema(parsedConfig);
 
       // Check schema cache
-      if (cachedSchema) {
-        const cachedSchemaObj = JSON.parse(
-          decompress(Buffer.from(cachedSchema, 'utf-8'), 'gzip').toString()
-        ) as ConfigSchema;
-
+      //
+      // BASE64, and an unreadable entry is a MISS. `Buffer.from(x, 'utf-8')`
+      // cannot recover binary gzip -- utf8 replaces every invalid sequence, so
+      // 154 bytes come back as 263 different ones (measured) and decompress
+      // throws "incorrect header check". Reading it as base64 fixes new
+      // entries; ignoring an unreadable one is what stops an entry written by
+      // the older, broken version from failing this call for ever.
+      const cachedSchemaObj = readCompressedJson<ConfigSchema>(
+        this.cache,
+        cachedSchema,
+        schemaCacheKey
+      );
+      if (cachedSchemaObj) {
         // Compare schemas to detect structural changes
         if (!this.schemasMatch(cachedSchemaObj, inferredSchema)) {
           suggestions.push(
@@ -240,14 +255,12 @@ export class SmartConfigReadTool {
     // Handle diff mode if we have cached data
     if (cachedData && diffMode) {
       try {
-        const decompressed = decompress(
-          Buffer.from(cachedData, 'utf-8'),
-          'gzip'
+        const cachedConfig = readCompressedJson<Record<string, unknown>>(
+          this.cache,
+          cachedData,
+          configCacheKey
         );
-        const cachedConfig = JSON.parse(decompressed.toString()) as Record<
-          string,
-          unknown
-        >;
+        if (!cachedConfig) throw new Error('cached config unreadable');
 
         // Calculate diff
         diffData = this.calculateDiff(cachedConfig, parsedConfig);
@@ -301,7 +314,9 @@ export class SmartConfigReadTool {
       const configCompressed = compress(JSON.stringify(parsedConfig), 'gzip');
       this.cache.set(
         configCacheKey,
-        configCompressed.toString(),
+        // BASE64. `.toString()` with no encoding is utf8, which mangles binary
+        // gzip irreversibly and poisons the entry permanently.
+        configCompressed.compressed.toString('base64'),
         tokensSaved,
         ttl
       );
@@ -311,7 +326,12 @@ export class SmartConfigReadTool {
           JSON.stringify(inferredSchema),
           'gzip'
         );
-        this.cache.set(schemaCacheKey, schemaCompressed.toString(), 0, ttl);
+        this.cache.set(
+          schemaCacheKey,
+          schemaCompressed.compressed.toString('base64'),
+          0,
+          ttl
+        );
       }
     }
 
@@ -831,6 +851,14 @@ export const SMART_CONFIG_READ_TOOL_DEFINITION = {
         type: 'number',
         description: 'Cache time-to-live in seconds (default: 604800 = 7 days)',
         default: 604800,
+      },
+      // DECLARED BECAUSE THEY ARE ACCEPTED: the server spreads the caller's whole
+      // argument object into options, so these worked while being undiscoverable.
+      enableCache: {
+        type: 'boolean',
+        description:
+          'Reuse a cached parse of this config when it has not changed',
+        default: true,
       },
     },
     required: ['path'],

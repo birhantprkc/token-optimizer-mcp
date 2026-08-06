@@ -225,13 +225,13 @@ export class SmartBranchTool {
       let originalTokens: number;
       if (opts.namesOnly) {
         // Name-only mode: estimate full output would be 10x more tokens
-        originalTokens = resultTokenCount * 10;
+        originalTokens = resultTokenCount; // measured, not assumed: a multiplier here would invent a saving
       } else if (!opts.includeCommit && !opts.includeTracking) {
         // Basic info mode: estimate full output would be 5x more tokens
-        originalTokens = resultTokenCount * 5;
+        originalTokens = resultTokenCount; // measured, not assumed: a multiplier here would invent a saving
       } else {
         // Full info mode: estimate full output would be 2.5x more tokens
-        originalTokens = resultTokenCount * 2.5;
+        originalTokens = resultTokenCount; // measured, not assumed: a multiplier here would invent a saving
       }
 
       const tokensSaved = originalTokens - resultTokenCount;
@@ -658,6 +658,40 @@ export const SMART_BRANCH_TOOL_DEFINITION = {
         enum: ['name', 'date', 'author'],
         description: 'Field to sort by',
         default: 'name',
+      },
+      // DECLARED BECAUSE THEY ARE ACCEPTED: the server spreads the caller's whole
+      // argument object into options, so these worked while being undiscoverable.
+      local: {
+        type: 'boolean',
+        description:
+          'Restrict to local branches, excluding remote-tracking ones',
+        default: false,
+      },
+      mergedInto: {
+        type: 'string',
+        description: 'Only branches already merged into this ref',
+      },
+      sortOrder: {
+        type: 'string',
+        enum: ['asc', 'desc'],
+        description: 'Sort direction for sortBy',
+        default: 'asc',
+      },
+      offset: {
+        type: 'number',
+        description:
+          'Skip this many results before returning any; use with limit to page',
+        default: 0,
+      },
+      useCache: {
+        type: 'boolean',
+        description: 'Serve a previously cached result for the same query',
+        default: false,
+      },
+      ttl: {
+        type: 'number',
+        description: 'Cache lifetime in seconds, when useCache is on',
+        default: 300,
       },
     },
   },

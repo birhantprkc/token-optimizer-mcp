@@ -14,6 +14,12 @@
 
 import { spawn, ChildProcess } from 'child_process';
 import { execFileSafe, assertSafeArg } from '../../utils/safe-exec.js';
+import {
+  parseWmicCsvRows,
+  numericField,
+  lifetimeCpuPercent,
+  parseWmiDate,
+} from '../../utils/wmic-csv.js';
 import { CacheEngine } from '../../core/cache-engine.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import { MetricsCollector } from '../../core/metrics.js';
@@ -269,7 +275,7 @@ export class SmartProcess {
       if (cached) {
         const dataStr = cached;
         const tokensUsed = this.tokenCounter.count(dataStr).tokens;
-        const baselineTokens = tokensUsed * 20; // Estimate baseline
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -286,9 +292,27 @@ export class SmartProcess {
     }
 
     // Fresh status check
-    const processes = await this.listProcesses(options.pid, options.name);
+    const allProcesses = await this.listProcesses(options.pid, options.name);
+
+    // A MACHINE'S PROCESS TABLE IS NOT A BOUNDED THING.
+    //
+    // Asked for a plain status with no pid or name filter, this returned every
+    // process on the box: 27,895 tokens in one response on an ordinary
+    // workstation, roughly 14% of a 200k context window spent on a listing.
+    // The caller almost never wants all of it, and the ones who do can page.
+    const LIST_CAP = 200;
+    const processes = allProcesses.slice(0, LIST_CAP);
+    const omitted = allProcesses.length - processes.length;
+
     const dataStr = JSON.stringify({ processes });
     const tokensUsed = this.tokenCounter.count(dataStr).tokens;
+
+    // What the full table would have cost, measured from the table itself --
+    // so the saving is real and the omission is stated rather than silent.
+    const fullTokens = omitted
+      ? this.tokenCounter.count(JSON.stringify({ processes: allProcesses }))
+          .tokens
+      : tokensUsed;
 
     // Cache the result
     if (useCache) {
@@ -298,10 +322,21 @@ export class SmartProcess {
     return {
       success: true,
       operation: 'status',
-      data: { processes },
+      data: {
+        processes,
+        ...(omitted
+          ? {
+              truncated: true,
+              totalProcesses: allProcesses.length,
+              note:
+                `Showing ${processes.length} of ${allProcesses.length} processes. ` +
+                `Pass a pid or name to narrow the result.`,
+            }
+          : {}),
+      },
       metadata: {
         tokensUsed,
-        tokensSaved: 0,
+        tokensSaved: Math.max(0, fullTokens - tokensUsed),
         cacheHit: false,
         executionTime: 0,
       },
@@ -370,7 +405,7 @@ export class SmartProcess {
       if (cached) {
         const dataStr = cached;
         const tokensUsed = this.tokenCounter.count(dataStr).tokens;
-        const baselineTokens = tokensUsed * 20; // Estimate baseline
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -440,8 +475,11 @@ export class SmartProcess {
     name?: string
   ): Promise<ProcessInfo[]> {
     // Use WMIC on Windows (argv mode; validate caller-controlled inputs)
+    // CreationDate added: without it `cpu` cannot be computed at all (it was
+    // hardcoded to 0) and `startTime` was Date.now(), i.e. the time of the
+    // query rather than the time the process started.
     const fields =
-      'ProcessId,Name,CommandLine,HandleCount,ThreadCount,WorkingSetSize,KernelModeTime,UserModeTime';
+      'ProcessId,Name,CommandLine,HandleCount,ThreadCount,WorkingSetSize,KernelModeTime,UserModeTime,CreationDate';
     const wmicArgs = ['process'];
     if (pid !== undefined) {
       const pidNum = Math.floor(Number(pid));
@@ -455,26 +493,43 @@ export class SmartProcess {
 
     const { stdout } = await execFileSafe('wmic', wmicArgs);
 
-    // Parse CSV output
-    const lines = stdout.trim().split('\n').slice(1); // Skip header
+    // EVERY FIELD BUT `threads` USED TO BE READ FROM THE WRONG COLUMN, because
+    // this indexed by the order the fields were REQUESTED and wmic emits them
+    // alphabetically behind a `Node` column. Called live against this machine's
+    // 200-process table, the old mapping produced:
+    //
+    //   pid     parseInt('explorer.exe') -> 0            0 for 175 of 200
+    //   name    KernelModeTime           -> '926221273437500'   integer for 182 of 200
+    //   command Node                     -> 'SUPER-COMPUTER'    hostname for 200 of 200
+    //   memory  UserModeTime             -> nonsense
+    //   handles CommandLine              -> 0 for 200 of 200
+    //   threads ThreadCount              -> correct, by coincidence
+    //
+    // Columns are now resolved by NAME from the header wmic actually printed,
+    // which is also what makes a comma inside a command line harmless.
+    const now = Date.now();
     const processes: ProcessInfo[] = [];
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
+    for (const row of parseWmicCsvRows(stdout)) {
+      const pid = numericField(row, 'ProcessId');
+      if (pid === null) continue;
 
-      const parts = line.split(',');
-      if (parts.length < 7) continue;
+      const kernel = numericField(row, 'KernelModeTime') ?? 0;
+      const user = numericField(row, 'UserModeTime') ?? 0;
+      const created = row.CreationDate ?? '';
 
       processes.push({
-        pid: parseInt(parts[4]) || 0,
-        name: parts[3] || '',
-        command: parts[0] || '',
-        cpu: 0, // Calculate from kernel + user time
-        memory: parseInt(parts[7]) || 0,
+        pid,
+        name: row.Name ?? '',
+        command: row.CommandLine || row.Name || '',
+        // Was hardcoded 0 with a comment saying to calculate it from kernel +
+        // user time, which never happened. Same definition as `ps aux` %CPU.
+        cpu: created ? lifetimeCpuPercent(kernel + user, created, now) : 0,
+        memory: numericField(row, 'WorkingSetSize') ?? 0,
         status: 'running',
-        startTime: Date.now(),
-        handles: parseInt(parts[1]) || 0,
-        threads: parseInt(parts[6]) || 0,
+        startTime: parseWmiDate(created) ?? now,
+        handles: numericField(row, 'HandleCount') ?? 0,
+        threads: numericField(row, 'ThreadCount') ?? 0,
       });
     }
 

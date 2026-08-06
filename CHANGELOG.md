@@ -5,6 +5,118 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.4.3](https://github.com/ooples/token-optimizer-mcp/compare/v5.4.2...v5.4.3) (2026-08-05)
+
+
+### Bug Fixes
+
+* **hooks:** a write is not a read, and compaction ends the claim ([#257](https://github.com/ooples/token-optimizer-mcp/issues/257)) ([84525c2](https://github.com/ooples/token-optimizer-mcp/commit/84525c206ab60ac3351b7ab7850c2d956e75fbbd))
+* **mcp:** declare the options tools accept, and ratchet the rest ([#258](https://github.com/ooples/token-optimizer-mcp/issues/258)) ([30dc75d](https://github.com/ooples/token-optimizer-mcp/commit/30dc75d82c74c6cbb3c99746b0ff1335703ea70f))
+* **mcp:** finish declaring every option every tool accepts ([#261](https://github.com/ooples/token-optimizer-mcp/issues/261)) ([03828e9](https://github.com/ooples/token-optimizer-mcp/commit/03828e9516a23f8052e4fc9a1cf8b4a0abbee3c1))
+* **release:** resolve the mcp spec at launch instead of pinning it in git ([#256](https://github.com/ooples/token-optimizer-mcp/issues/256)) ([9672b39](https://github.com/ooples/token-optimizer-mcp/commit/9672b39e4cfe6b8818b342b85b95d8e6d0511e31))
+* **release:** verify the released tag instead of repairing it first ([#260](https://github.com/ooples/token-optimizer-mcp/issues/260)) ([da596ca](https://github.com/ooples/token-optimizer-mcp/commit/da596ca70cae51f4dcffa0e0e8a5339087a207c3))
+
+## [5.4.2](https://github.com/ooples/token-optimizer-mcp/compare/v5.4.1...v5.4.2) (2026-08-05)
+
+
+### Bug Fixes
+
+* **release:** repair the pins during the release instead of failing on them ([#253](https://github.com/ooples/token-optimizer-mcp/issues/253)) ([5c005f3](https://github.com/ooples/token-optimizer-mcp/commit/5c005f319c5facb4ce4605104c155a1a8bb0abdc))
+* **release:** sync pinned specs from an event that actually fires ([#254](https://github.com/ooples/token-optimizer-mcp/issues/254)) ([e7ff984](https://github.com/ooples/token-optimizer-mcp/commit/e7ff984ef88adc1be6cccb5ce28e77114063de00))
+
+## [5.4.1](https://github.com/ooples/token-optimizer-mcp/compare/v5.4.0...v5.4.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* **doctor:** report whether finding extraction is actually running ([#247](https://github.com/ooples/token-optimizer-mcp/issues/247)) ([7367250](https://github.com/ooples/token-optimizer-mcp/commit/7367250ecbea9a293a576b7edbe5214b7424b322))
+* **harness:** make the a/b measurement instrument repeatable ([#246](https://github.com/ooples/token-optimizer-mcp/issues/246)) ([219d62a](https://github.com/ooples/token-optimizer-mcp/commit/219d62ad49f7b81c8993791c70486c5d5385795a))
+* **metrics:** the causal measurement had never produced a single reading ([#251](https://github.com/ooples/token-optimizer-mcp/issues/251)) ([516a032](https://github.com/ooples/token-optimizer-mcp/commit/516a032b418c87bc8ee13a5bd6fdd5c0c1b846cd))
+* **release:** unblock the 5.4.0 publish, and stop the harvest worker crashing on exit ([#245](https://github.com/ooples/token-optimizer-mcp/issues/245)) ([1ecd165](https://github.com/ooples/token-optimizer-mcp/commit/1ecd165227cfa6a242ef3fa71f4eeafc710f37ba))
+* **search:** honour `path` and survive oversized result sets ([#249](https://github.com/ooples/token-optimizer-mcp/issues/249)) ([bf3870f](https://github.com/ooples/token-optimizer-mcp/commit/bf3870fcec33e7bf004c734f91b7790f266c3585))
+
+## [5.4.0](https://github.com/ooples/token-optimizer-mcp/compare/v5.3.6...v5.4.0) (2026-08-04)
+
+
+### Features
+
+* **hooks:** wire co-occurrence to restoration, so the graph can predict ([#240](https://github.com/ooples/token-optimizer-mcp/issues/240)) ([41e422f](https://github.com/ooples/token-optimizer-mcp/commit/41e422fbdc76a2cae6c9aae6f264453670ee89f2))
+* **inject:** deliver findings to the model, and measure whether it helps ([#235](https://github.com/ooples/token-optimizer-mcp/issues/235)) ([e1f6d2f](https://github.com/ooples/token-optimizer-mcp/commit/e1f6d2f05ea4f4ac559f71841809a1712bc1a54e))
+* **lessons:** capture user corrections and deliver them back as instructions ([#236](https://github.com/ooples/token-optimizer-mcp/issues/236)) ([f2fa046](https://github.com/ooples/token-optimizer-mcp/commit/f2fa046a97dc13907d6bdcc0dddb8159336e1c93))
+
+
+### Bug Fixes
+
+* **ci:** let the release-pin sync be triggered manually ([#244](https://github.com/ooples/token-optimizer-mcp/issues/244)) ([16fc1c5](https://github.com/ooples/token-optimizer-mcp/commit/16fc1c5061bfccb9f4d7d32f85552cd39cdb8344))
+* install verification, plugin-aware doctor, and release pin drift ([#241](https://github.com/ooples/token-optimizer-mcp/issues/241)) ([0295a23](https://github.com/ooples/token-optimizer-mcp/commit/0295a23d0b46919c80b53524eaa0f0de335692dc))
+* **paths:** canonicalise to a fixed point by construction, not by patching ([#243](https://github.com/ooples/token-optimizer-mcp/issues/243)) ([1ce8308](https://github.com/ooples/token-optimizer-mcp/commit/1ce8308fd31625ce18d7b6b223b0bac1b651307a))
+
+## [5.3.6](https://github.com/ooples/token-optimizer-mcp/compare/v5.3.5...v5.3.6) (2026-08-04)
+
+
+### Bug Fixes
+
+* **cache:** original and compressed sizes were recorded backwards ([#227](https://github.com/ooples/token-optimizer-mcp/issues/227)) ([74f16c6](https://github.com/ooples/token-optimizer-mcp/commit/74f16c6b98862c7a34c4770d45181ddbaf9196e2))
+* **curate:** a correction claimed to be a person's assertion ([#232](https://github.com/ooples/token-optimizer-mcp/issues/232)) ([5d822f3](https://github.com/ooples/token-optimizer-mcp/commit/5d822f38706d42ad7aadfa8f942b7bc936ce31f5))
+* **security:** scanner reported no findings over live-format api keys ([#223](https://github.com/ooples/token-optimizer-mcp/issues/223)) ([beb2ebd](https://github.com/ooples/token-optimizer-mcp/commit/beb2ebdd9065ff68f7b31492875025c39a48b97d))
+* **server:** mistyped tool arguments were dropped instead of refused ([#228](https://github.com/ooples/token-optimizer-mcp/issues/228)) ([800d4e0](https://github.com/ooples/token-optimizer-mcp/commit/800d4e00fbdcf36a4c75aa7e0422bc9315819798))
+* smart_ast_grep was entirely non-functional on windows, and said nothing ([#226](https://github.com/ooples/token-optimizer-mcp/issues/226)) ([56873b9](https://github.com/ooples/token-optimizer-mcp/commit/56873b93d7d04c11d8167b66f55d07dc3aa7f387))
+* smart_env returned every .env value; smart_dependencies never delivered its graph ([#225](https://github.com/ooples/token-optimizer-mcp/issues/225)) ([a963995](https://github.com/ooples/token-optimizer-mcp/commit/a963995b91d2865b4f9c982d29877f8f7d5d2ce8))
+* **smart-edit:** a silently dropped edit reported success ([#231](https://github.com/ooples/token-optimizer-mcp/issues/231)) ([31c5394](https://github.com/ooples/token-optimizer-mcp/commit/31c53946d59cce5e4e8f959a487d921cd62e5001))
+* **tokens:** counting silently fell back to length/4, overstating savings by up to 130% ([#222](https://github.com/ooples/token-optimizer-mcp/issues/222)) ([97a9027](https://github.com/ooples/token-optimizer-mcp/commit/97a90276f41670a857103b859d63566d820c0317))
+* **wiki:** the semantic harvest was implemented but never invoked ([#229](https://github.com/ooples/token-optimizer-mcp/issues/229)) ([895f14b](https://github.com/ooples/token-optimizer-mcp/commit/895f14b590e8f3b7cdbc3416f5dbf4406ac0f180))
+
+## [5.3.5](https://github.com/ooples/token-optimizer-mcp/compare/v5.3.4...v5.3.5) (2026-08-02)
+
+
+### Bug Fixes
+
+* a fresh windows clone failed its own test suite and format check ([#220](https://github.com/ooples/token-optimizer-mcp/issues/220)) ([9709c12](https://github.com/ooples/token-optimizer-mcp/commit/9709c12db8f689bd4961989b8f31375052db0d88))
+
+## [5.3.4](https://github.com/ooples/token-optimizer-mcp/compare/v5.3.3...v5.3.4) (2026-08-01)
+
+
+### Bug Fixes
+
+* windows command-output parsing was wrong in five dispatched tools ([#218](https://github.com/ooples/token-optimizer-mcp/issues/218)) ([9f8a63d](https://github.com/ooples/token-optimizer-mcp/commit/9f8a63d35e8f515b48351d9debf6b41d61acdb60))
+
+## [5.3.3](https://github.com/ooples/token-optimizer-mcp/compare/v5.3.2...v5.3.3) (2026-08-01)
+
+
+### Bug Fixes
+
+* consolidate every live-test fix into one verified release ([#217](https://github.com/ooples/token-optimizer-mcp/issues/217)) ([ea8d1aa](https://github.com/ooples/token-optimizer-mcp/commit/ea8d1aa1b11ca8a6a180362fe53d3a3a898ca033))
+* **doctor:** give each run a fresh session, so it stops failing its own second run ([#213](https://github.com/ooples/token-optimizer-mcp/issues/213)) ([8761b1f](https://github.com/ooples/token-optimizer-mcp/commit/8761b1f22ee21d75aa86deedea4cebf8a98493cb))
+* **graph:** wire the memory half — harvest had no call site anywhere ([#215](https://github.com/ooples/token-optimizer-mcp/issues/215)) ([efa10ab](https://github.com/ooples/token-optimizer-mcp/commit/efa10ab9284cb8bcbc491907d61870d6109ce313))
+* **install:** make wiring recoverable when npm blocks postinstall ([#214](https://github.com/ooples/token-optimizer-mcp/issues/214)) ([f6e146c](https://github.com/ooples/token-optimizer-mcp/commit/f6e146c0dfd510b3425efc1880a16abc94f405d2))
+
+## [5.3.2](https://github.com/ooples/token-optimizer-mcp/compare/v5.3.1...v5.3.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* **pkg:** ship the enforcement hooks and installer scripts ([#211](https://github.com/ooples/token-optimizer-mcp/issues/211)) ([d05babd](https://github.com/ooples/token-optimizer-mcp/commit/d05babd0e86ae900f3965ccfad769a5c0dba1106))
+
+## [5.3.1](https://github.com/ooples/token-optimizer-mcp/compare/v5.3.0...v5.3.1) (2026-07-31)
+
+
+### CI/CD
+
+* cancel a PR's runs when it closes, instead of leaving them to drain ([#210](https://github.com/ooples/token-optimizer-mcp/issues/210)) ([cf386d6](https://github.com/ooples/token-optimizer-mcp/commit/cf386d6b5ea4a5e91403aea96255b4a0f583256b))
+* skip redundant jobs on the release merge commit, not just the release PR ([#208](https://github.com/ooples/token-optimizer-mcp/issues/208)) ([c4945aa](https://github.com/ooples/token-optimizer-mcp/commit/c4945aacec94d04892467b5bac862a77c62517a1))
+
+## [5.3.0](https://github.com/ooples/token-optimizer-mcp/compare/v5.2.0...v5.3.0) (2026-07-31)
+
+
+### Features
+
+* optimize tokens by default on install, across all 15 CLI clients ([#203](https://github.com/ooples/token-optimizer-mcp/issues/203)) ([44d633b](https://github.com/ooples/token-optimizer-mcp/commit/44d633b1ba4a5cb862d5ac3f0251351c4605b147))
+
+
+### Bug Fixes
+
+* **ci:** let release PRs satisfy required checks instead of skipping them ([#206](https://github.com/ooples/token-optimizer-mcp/issues/206)) ([97daa05](https://github.com/ooples/token-optimizer-mcp/commit/97daa05d1fe324744499ef445afb81ffadc09722))
+
 ## [5.2.0](https://github.com/ooples/token-optimizer-mcp/compare/v5.1.3...v5.2.0) (2026-07-21)
 
 

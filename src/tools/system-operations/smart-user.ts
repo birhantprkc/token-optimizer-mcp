@@ -22,6 +22,10 @@ import { MetricsCollector } from '../../core/metrics.js';
 import { readFileSync } from 'fs';
 import * as crypto from 'crypto';
 import { execFileSafe, assertSafeArg } from '../../utils/safe-exec.js';
+import {
+  parseNetUserList,
+  parseNetLocalGroupList,
+} from '../../utils/net-command-output.js';
 
 /**
  * SECURITY (CWE-78): every external command in this tool now runs in argv mode
@@ -276,7 +280,7 @@ export class SmartUser {
       const cached = await this.cache.get(cacheKey);
       if (cached) {
         const tokensUsed = this.tokenCounter.count(cached).tokens;
-        const baselineTokens = tokensUsed * 20; // Estimate 20x baseline for full user data
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -330,7 +334,7 @@ export class SmartUser {
       const cached = await this.cache.get(cacheKey);
       if (cached) {
         const tokensUsed = this.tokenCounter.count(cached).tokens;
-        const baselineTokens = tokensUsed * 18; // Estimate 18x baseline for full group data
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -390,7 +394,7 @@ export class SmartUser {
       const cached = await this.cache.get(cacheKey);
       if (cached) {
         const tokensUsed = this.tokenCounter.count(cached).tokens;
-        const baselineTokens = tokensUsed * 15;
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -448,7 +452,7 @@ export class SmartUser {
       const cached = await this.cache.get(cacheKey);
       if (cached) {
         const tokensUsed = this.tokenCounter.count(cached).tokens;
-        const baselineTokens = tokensUsed * 12;
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -508,7 +512,7 @@ export class SmartUser {
       if (cached) {
         const dataStr = cached;
         const tokensUsed = this.tokenCounter.count(dataStr).tokens;
-        const baselineTokens = tokensUsed * 7;
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -564,7 +568,7 @@ export class SmartUser {
       if (cached) {
         const dataStr = cached;
         const tokensUsed = this.tokenCounter.count(dataStr).tokens;
-        const baselineTokens = tokensUsed * 8.5;
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -617,7 +621,7 @@ export class SmartUser {
       if (cached) {
         const dataStr = cached;
         const tokensUsed = this.tokenCounter.count(dataStr).tokens;
-        const baselineTokens = tokensUsed * 5;
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -671,7 +675,7 @@ export class SmartUser {
       if (cached) {
         const dataStr = cached;
         const tokensUsed = this.tokenCounter.count(dataStr).tokens;
-        const baselineTokens = tokensUsed * 25;
+        const baselineTokens = tokensUsed; // measured, not assumed: a multiplier here would invent a saving
 
         return {
           success: true,
@@ -800,26 +804,16 @@ export class SmartUser {
       // Windows: Use net user command
       try {
         const { stdout } = await execFileSafe('net', ['user']);
-        const lines = stdout.split('\n');
-        let inUserSection = false;
 
-        for (const line of lines) {
-          if (line.includes('---')) {
-            inUserSection = true;
-            continue;
-          }
-          if (inUserSection && line.trim()) {
-            const usernames = line.trim().split(/\s+/);
-            for (const username of usernames) {
-              if (username && !username.includes('command completed')) {
-                const userInfo = await this.getUserDetails(username).catch(
-                  () => null
-                );
-                if (userInfo) {
-                  users.push(userInfo);
-                }
-              }
-            }
+        // THREE FIXED-WIDTH COLUMNS, read by column. Splitting on whitespace
+        // worked only while no account name contained a space; one that does
+        // became two lookups that both fail, silently dropping the account.
+        for (const username of parseNetUserList(stdout)) {
+          const userInfo = await this.getUserDetails(username).catch(
+            () => null
+          );
+          if (userInfo) {
+            users.push(userInfo);
           }
         }
       } catch (error) {
@@ -888,26 +882,19 @@ export class SmartUser {
       // Windows: Use net localgroup command
       try {
         const { stdout } = await execFileSafe('net', ['localgroup']);
-        const lines = stdout.split('\n');
-        let inGroupSection = false;
 
-        for (const line of lines) {
-          if (line.includes('---')) {
-            inGroupSection = true;
-            continue;
-          }
-          if (inGroupSection && line.trim()) {
-            const groupnames = line.trim().split(/\s+/);
-            for (const groupname of groupnames) {
-              if (groupname && !groupname.includes('command completed')) {
-                const groupInfo = await this.getGroupDetails(groupname).catch(
-                  () => null
-                );
-                if (groupInfo) {
-                  groups.push(groupInfo);
-                }
-              }
-            }
+        // ONE NAME PER LINE. This used to split each line on whitespace and
+        // look up every token as a group, so `*Device Owners` became lookups
+        // for `*Device` and `Owners`. Measured on an ordinary desktop: 6 of 15
+        // groups returned, with `Users` listed twice -- once real, once as the
+        // trailing token of `*Distributed COM Users`. The `*` was never
+        // stripped either.
+        for (const groupname of parseNetLocalGroupList(stdout)) {
+          const groupInfo = await this.getGroupDetails(groupname).catch(
+            () => null
+          );
+          if (groupInfo) {
+            groups.push(groupInfo);
           }
         }
       } catch (error) {

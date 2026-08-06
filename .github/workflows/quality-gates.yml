@@ -16,11 +16,75 @@ permissions:
   contents: read
 
 jobs:
+  # Generated and pinned artifacts must match their sources.
+  #
+  # `sync:hooks:check` already existed and already detected this drift. It was
+  # simply never invoked by any workflow, so it never ran -- and seven client
+  # configs shipped pinned to 5.3.2 while the hooks beside them were 5.3.6.
+  #
+  # This job carries NO release-please skip on purpose. The version bump is
+  # precisely what knocks the pinned specs out of step, so a gate that skips
+  # release commits cannot see the only event that causes the failure.
+  generated-artifacts:
+    name: Generated Artifacts In Sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify hook core, client entries, configs and pins are in sync
+        run: npm run sync:hooks:check
+
+      # WIRED BECAUSE IT ROTTED WHILE UNWIRED. verify:clients asserts the SHAPE of
+      # every client integration -- that each declares the hooks and the launch
+      # spec its own documented format requires. No workflow ran it, so it kept
+      # asserting the numeric pin that #256 removed and sat at 104/129 checks,
+      # exit 1, for anyone who happened to run it by hand. A gate nothing runs is
+      # not a gate.
+      - name: Verify client integration shapes
+        run: npm run verify:clients
+
+      - name: Verify the harvest API contract
+        run: npm run verify:harvest
+
+      # BROWSER GATES. These verify the wiki dashboard actually works -- they
+      # caught a real defect the moment they were first run: an open detail panel
+      # overlaid the toolbar and list, so those controls could not be clicked at
+      # all. They need a browser, which is why they were never wired; that is a
+      # reason to add the install step, not a reason to leave a gate unrun.
+      # BUILD FIRST. verify-wiki-ui spawns dist/server/web-server.js -- its own
+      # comment says "The server serves from dist/, not src/" -- so without a
+      # build the server never comes up and the gate fails for a reason that has
+      # nothing to do with the dashboard. It passed locally only because dist/
+      # was already there.
+      - name: Build, because the UI gates serve from dist/
+        run: npm run build
+
+      - name: Install Chromium for the UI gates
+        run: npx playwright install --with-deps chromium
+
+      - name: Verify the wiki dashboard renders and behaves
+        run: npm run verify:ui
+
+      - name: Verify the wiki interactions
+        run: npm run verify:interactions
+
   bundle-size:
     name: Bundle Size Analysis
     runs-on: ubuntu-latest
     # Skip on release-please PRs (only bump version/changelog already validated on merge).
-    if: ${{ !startsWith(github.head_ref, 'release-please') }}
+    if: "${{ !startsWith(github.head_ref, 'release-please') && !startsWith(github.event.head_commit.message, 'chore(master): release') }}"
     timeout-minutes: 10
     permissions:
       contents: read
@@ -123,7 +187,7 @@ jobs:
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
-    if: ${{ !startsWith(github.head_ref, 'release-please') }}
+    if: "${{ !startsWith(github.head_ref, 'release-please') && !startsWith(github.event.head_commit.message, 'chore(master): release') }}"
     timeout-minutes: 10
     permissions:
       contents: read
@@ -231,7 +295,7 @@ jobs:
   license-compliance:
     name: License Compliance
     runs-on: ubuntu-latest
-    if: ${{ !startsWith(github.head_ref, 'release-please') }}
+    if: "${{ !startsWith(github.head_ref, 'release-please') && !startsWith(github.event.head_commit.message, 'chore(master): release') }}"
     timeout-minutes: 10
     permissions:
       contents: read
@@ -329,7 +393,7 @@ jobs:
   dependency-vulnerabilities:
     name: Dependency Vulnerability Scan
     runs-on: ubuntu-latest
-    if: ${{ !startsWith(github.head_ref, 'release-please') }}
+    if: "${{ !startsWith(github.head_ref, 'release-please') && !startsWith(github.event.head_commit.message, 'chore(master): release') }}"
     timeout-minutes: 10
 
     steps:
@@ -380,7 +444,7 @@ jobs:
   code-quality:
     name: Code Quality Metrics
     runs-on: ubuntu-latest
-    if: ${{ !startsWith(github.head_ref, 'release-please') }}
+    if: "${{ !startsWith(github.head_ref, 'release-please') && !startsWith(github.event.head_commit.message, 'chore(master): release') }}"
     timeout-minutes: 10
 
     steps:

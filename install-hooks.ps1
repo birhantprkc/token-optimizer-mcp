@@ -88,152 +88,71 @@ function Test-Prerequisites {
 function Install-HooksFiles {
     Write-Status "Installing hooks files..." "INFO"
 
-    # Create hooks directory
-    if (-not (Test-Path $HOOKS_DIR)) {
-        New-Item -ItemType Directory -Path $HOOKS_DIR -Force | Out-Null
-        Write-Status " Created hooks directory: $HOOKS_DIR" "SUCCESS"
+    # Install the CURRENT hook files from the package.
+    #
+    # This used to download a dispatcher.ps1 from the default branch and wire
+    # four events at it -- none of them SessionStart, which is where the policy
+    # and the project briefing are delivered. The plugin's real hooks are three
+    # ES modules under plugin/hooks, and they are what the doctor probes.
+    $sourceHooks = Join-Path $PSScriptRoot "plugin\hooks"
+    if (-not (Test-Path $sourceHooks)) {
+        $sourceHooks = Join-Path $MCP_GLOBAL_PATH "plugin\hooks"
     }
 
-    # Create subdirectories
-    @("handlers", "helpers", "logs", "data") | ForEach-Object {
-        $dir = Join-Path $HOOKS_DIR $_
-        if (-not (Test-Path $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        }
+    if (-not (Test-Path $sourceHooks)) {
+        Write-Status "Could not find the plugin hooks to install (looked in $sourceHooks)" "ERROR"
+        Write-Status "Reinstall the package: npm install -g @ooples/token-optimizer-mcp" "INFO"
+        throw "Plugin hooks not found"
     }
 
     if ($DryRun) {
-        Write-Status "[DRY RUN] Would download hooks files from $REPO_URL" "INFO"
+        Write-Status "[DRY RUN] Would install the plugin hooks into $HOOKS_DIR	oken-optimizer" "INFO"
         return
     }
 
-    # Download hooks files.
-    # IMPORTANT: the orchestrator dot-sources logging.ps1, config.ps1, gzip.ps1
-    # and context-delta.ps1 at startup, and both the orchestrator and
-    # context-delta.ps1 call invoke-mcp.ps1 at runtime. If ANY of these is
-    # missing, every hook invocation dies with "Write-Log is not recognized"
-    # (etc.), so ALL of them must be downloaded — not just the dispatcher trio.
-    $files = @(
-        @{ Source = "$REPO_URL/dispatcher.ps1"; Dest = "$HOOKS_DIR\dispatcher.ps1" },
-        @{ Source = "$REPO_URL/handlers/token-optimizer-orchestrator.ps1"; Dest = "$HOOKS_DIR\handlers\token-optimizer-orchestrator.ps1" },
-        @{ Source = "$REPO_URL/helpers/invoke-mcp.ps1"; Dest = "$HOOKS_DIR\helpers\invoke-mcp.ps1" },
-        @{ Source = "$REPO_URL/helpers/logging.ps1"; Dest = "$HOOKS_DIR\helpers\logging.ps1" },
-        @{ Source = "$REPO_URL/helpers/config.ps1"; Dest = "$HOOKS_DIR\helpers\config.ps1" },
-        @{ Source = "$REPO_URL/helpers/gzip.ps1"; Dest = "$HOOKS_DIR\helpers\gzip.ps1" },
-        @{ Source = "$REPO_URL/helpers/context-delta.ps1"; Dest = "$HOOKS_DIR\helpers\context-delta.ps1" }
-    )
-
-    foreach ($file in $files) {
-        try {
-            Write-Status "Downloading: $($file.Source)" "INFO"
-            Invoke-WebRequest -Uri $file.Source -OutFile $file.Dest -UseBasicParsing
-            Write-Status " Downloaded: $(Split-Path $file.Dest -Leaf)" "SUCCESS"
-        } catch {
-            Write-Status " Failed to download $($file.Source): $($_.Exception.Message)" "ERROR"
-            Write-Status "Using local package files instead..." "INFO"
-
-            # Fallback: Copy from npm package
-            $npmPath = "$env:APPDATA\npm\node_modules\@ooples\token-optimizer-mcp\hooks"
-            if (Test-Path $npmPath) {
-                Copy-Item -Path "$npmPath\*" -Destination $HOOKS_DIR -Recurse -Force
-                Write-Status " Copied hooks from npm package" "SUCCESS"
-            } else {
-                throw "Could not download hooks and npm package not found"
-            }
-        }
-    }
+    # Under a token-optimizer\ subdirectory on purpose: it puts our marker into
+    # every command string we write, which is what makes the entries findable
+    # for verification and removable on uninstall.
+    $dest = Join-Path $HOOKS_DIR "token-optimizer"
+    if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+    Copy-Item -Path (Join-Path $sourceHooks "*") -Destination $dest -Recurse -Force
+    Write-Status "Installed hooks to $dest" "SUCCESS"
 }
 
 function Configure-ClaudeSettings {
     Write-Status "Configuring Claude Code settings..." "INFO"
 
-    # Ensure settings directory exists
-    $settingsDir = Split-Path $CLAUDE_SETTINGS
-    if (-not (Test-Path $settingsDir)) {
-        New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
-        Write-Status " Created settings directory: $settingsDir" "SUCCESS"
+    # Wire the hooks by MERGING, never by overwriting.
+    #
+    # The previous version assigned $settings.hooks wholesale, which destroyed
+    # every hook the user had configured -- silently, and from a tool whose
+    # uninstaller promises it never touches anything it did not write. The merge
+    # now lives in scripts/wire-hooks.mjs, shared with the bash installer and
+    # covered by tests.
+    $wireScript = Join-Path $PSScriptRoot "scripts\wire-hooks.mjs"
+    if (-not (Test-Path $wireScript)) {
+        $wireScript = Join-Path $MCP_GLOBAL_PATH "scripts\wire-hooks.mjs"
     }
 
-    # Backup existing settings
-    if (Test-Path $CLAUDE_SETTINGS) {
-        $backup = "$CLAUDE_SETTINGS.backup.$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-        Copy-Item $CLAUDE_SETTINGS $backup
-        Write-Status " Backed up existing settings to: $backup" "SUCCESS"
-    }
-
-    # Create or update settings.json
-    $settings = if (Test-Path $CLAUDE_SETTINGS) {
-        Get-Content $CLAUDE_SETTINGS -Raw | ConvertFrom-Json
-    } else {
-        @{}
-    }
-
-    # Add hooks configuration.
-    # The command must be shell-safe: Claude Code may run hook commands through
-    # bash (e.g. when Git Bash is on PATH), where an UNQUOTED Windows path has
-    # its backslashes silently stripped, corrupting the path. So quote the
-    # dispatcher path. Also pass -NoProfile (don't load the user's PS profile)
-    # and -ExecutionPolicy Bypass (so the hook runs regardless of local policy).
-    $dispatcherPath = Join-Path $HOOKS_DIR "dispatcher.ps1"
-    $hookCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$dispatcherPath`" -Phase"
-
-    $settings.hooks = @{
-        PreToolUse = @(
-            @{
-                matcher = "*"
-                hooks = @(
-                    @{
-                        type = "command"
-                        command = "$hookCommand PreToolUse"
-                    }
-                )
-            }
-        )
-        PostToolUse = @(
-            @{
-                matcher = "*"
-                hooks = @(
-                    @{
-                        type = "command"
-                        command = "$hookCommand PostToolUse"
-                    }
-                )
-            }
-        )
-        UserPromptSubmit = @(
-            @{
-                matcher = "*"
-                hooks = @(
-                    @{
-                        type = "command"
-                        command = "$hookCommand UserPromptSubmit"
-                    }
-                )
-            }
-        )
-        PreCompact = @(
-            @{
-                matcher = "*"
-                hooks = @(
-                    @{
-                        type = "command"
-                        command = "$hookCommand PreCompact"
-                    }
-                )
-            }
-        )
-    }
-
-    if ($DryRun) {
-        Write-Status "[DRY RUN] Would write hooks configuration to: $CLAUDE_SETTINGS" "INFO"
-        Write-Status ($settings | ConvertTo-Json -Depth 10) "INFO"
+    if (-not (Test-Path $wireScript)) {
+        Write-Status "Could not find wire-hooks.mjs; settings were NOT modified" "ERROR"
         return
     }
 
-    # Save settings (without BOM)
-    $json = $settings | ConvertTo-Json -Depth 10
-    [System.IO.File]::WriteAllText($CLAUDE_SETTINGS, $json, (New-Object System.Text.UTF8Encoding $false))
-    Write-Status " Updated Claude Code settings" "SUCCESS"
+    $hooksTarget = Join-Path $HOOKS_DIR "token-optimizer"
+
+    if ($DryRun) {
+        & node $wireScript $CLAUDE_SETTINGS $hooksTarget --dry-run
+        return
+    }
+
+    & node $wireScript $CLAUDE_SETTINGS $hooksTarget
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "Could not wire hooks into $CLAUDE_SETTINGS" "ERROR"
+        return
+    }
+
+    Write-Status "Updated Claude Code settings" "SUCCESS"
 }
 
 function Configure-WorkspaceTrust {
@@ -423,16 +342,27 @@ function Test-Installation {
 
     $issues = @()
 
-    # Check hooks files exist (including every helper the orchestrator
-    # dot-sources — a missing helper breaks every hook invocation).
+    # Verify the files this installer ACTUALLY SHIPS.
+    #
+    # This list used to require a dispatcher.ps1 plus handlers/ and helpers/
+    # shell libraries -- the design Install-HooksFiles replaced with three ES
+    # modules, as the comment above it says. None of those files has been
+    # produced by an install for some time, so verification could not pass, and
+    # a failed verification skipped record-install.mjs. That is why the doctor
+    # reports "no record of what was installed": the installer was prevented
+    # from writing the manifest by a check on files it no longer creates.
+    #
+    # Note the subdirectory: Install-HooksFiles copies into
+    # $HOOKS_DIR\token-optimizer, not $HOOKS_DIR. The old list omitted it, so
+    # every path was wrong twice over.
     $requiredFiles = @(
-        "$HOOKS_DIR\dispatcher.ps1",
-        "$HOOKS_DIR\handlers\token-optimizer-orchestrator.ps1",
-        "$HOOKS_DIR\helpers\invoke-mcp.ps1",
-        "$HOOKS_DIR\helpers\logging.ps1",
-        "$HOOKS_DIR\helpers\config.ps1",
-        "$HOOKS_DIR\helpers\gzip.ps1",
-        "$HOOKS_DIR\helpers\context-delta.ps1"
+        "$HOOKS_DIR\token-optimizer\session-start.mjs",
+        "$HOOKS_DIR\token-optimizer\pretooluse-router.mjs",
+        "$HOOKS_DIR\token-optimizer\precompact-optimize.mjs",
+        "$HOOKS_DIR\token-optimizer\hooks.json",
+        # The shared library every hook imports. Present but empty would break
+        # all three entrypoints, so it is checked explicitly.
+        "$HOOKS_DIR\token-optimizer\lib\policy.mjs"
     )
 
     foreach ($file in $requiredFiles) {
@@ -505,8 +435,14 @@ function Test-Installation {
         }
     }
 
+    # ADVISORY, NOT FATAL. This check looks for the server in
+    # claude_desktop_config.json, Cursor, Cline, Copilot and Windsurf. A Claude
+    # Code CLI user has it in none of them -- that path gets the MCP server from
+    # the plugin's own .mcp.json -- so treating absence as an installation
+    # failure fails the install for the primary supported client.
     if (-not $mcpConfigured) {
-        $issues += "token-optimizer MCP server not configured in any AI tool"
+        Write-Status "MCP server not found in Claude Desktop / Cursor / Cline / Copilot / Windsurf" "WARN"
+        Write-Status "That is expected on Claude Code, which gets the server from the plugin instead" "INFO"
     } else {
         Write-Status " MCP server configured in: $($checkedConfigs -join ', ')" "SUCCESS"
     }
@@ -563,6 +499,21 @@ try {
         Write-Status "DRY RUN COMPLETE - No changes were made" "SUCCESS"
     } else {
         $verified = Test-Installation
+
+        # RECORD THE MANIFEST REGARDLESS OF THE VERDICT.
+        #
+        # This used to sit inside `if ($verified)`, which inverted the
+        # relationship it needed: the manifest records what was written to this
+        # machine, and files were written before verification ran. Skipping it on
+        # failure leaves those files with no record of where they came from --
+        # exactly the case where an exact uninstall matters most. It is also why
+        # the doctor reported a missing manifest on a machine whose hooks were
+        # installed and working.
+        try {
+            & node (Join-Path $PSScriptRoot 'scripts/record-install.mjs') $HOOKS_DIR $CLAUDE_SETTINGS
+        } catch {
+            Write-Status "Could not record the install manifest (uninstall will be manual)" "WARN"
+        }
 
         if ($verified) {
             Write-Host ""

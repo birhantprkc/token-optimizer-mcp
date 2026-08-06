@@ -241,13 +241,18 @@ export class SmartStatusTool {
         ).tokens;
       }
 
-      // Estimate original tokens (if we had returned full git diff output)
-      const originalTokens = opts.summaryOnly
-        ? resultTokens * 50 // Summary mode: estimate diff would be 50x more
-        : resultTokens * 10; // File list mode: estimate diff would be 10x more
+      // THE RAW OUTPUT IS RIGHT HERE, so there is no reason to guess at it.
+      //
+      // This used `resultTokens * 50` in summary mode and `* 10` otherwise --
+      // two invented multipliers, reported as tokens saved. The actual
+      // alternative is the `git status --porcelain` output this tool parsed,
+      // which it already holds.
+      const rawTokens = this.tokenCounter.count(statusOutput).tokens;
+      const originalTokens = Math.max(resultTokens, rawTokens);
 
       const tokensSaved = originalTokens - resultTokens;
-      const compressionRatio = resultTokens / originalTokens;
+      const compressionRatio =
+        originalTokens > 0 ? resultTokens / originalTokens : 1;
 
       // Build result
       const result: SmartStatusResult = {
@@ -708,6 +713,40 @@ export const SMART_STATUS_TOOL_DEFINITION = {
       limit: {
         type: 'number',
         description: 'Maximum files to return',
+      },
+      // DECLARED BECAUSE THEY ARE ACCEPTED: the server spreads the caller's whole
+      // argument object into options, so these worked while being undiscoverable.
+      includeSize: {
+        type: 'boolean',
+        description: 'Include each file size, which costs a stat per file',
+        default: false,
+      },
+      includeUntracked: {
+        type: 'boolean',
+        description: 'Include files git does not track yet',
+        default: true,
+      },
+      includeIgnored: {
+        type: 'boolean',
+        description:
+          'Include ignored files, usually a large and low-signal set',
+        default: false,
+      },
+      offset: {
+        type: 'number',
+        description:
+          'Skip this many files before returning any; use with limit to page',
+        default: 0,
+      },
+      useCache: {
+        type: 'boolean',
+        description: 'Serve a previously cached result for the same query',
+        default: false,
+      },
+      ttl: {
+        type: 'number',
+        description: 'Cache lifetime in seconds, when useCache is on',
+        default: 300,
       },
     },
   },

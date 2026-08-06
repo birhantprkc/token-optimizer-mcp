@@ -19,7 +19,12 @@ import { CacheEngine } from '../../core/cache-engine.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import { MetricsCollector } from '../../core/metrics.js';
 import { generateCacheKey } from '../shared/hash-utils.js';
+import { fsGeneration } from '../../utils/fs-generation.js';
 import { detectFileType } from '../shared/syntax-utils.js';
+import {
+  resolveSearchScope,
+  limitToScopedFile,
+} from '../../utils/search-scope.js';
 
 export interface FileMetadata {
   path: string;
@@ -34,11 +39,19 @@ export interface FileMetadata {
 
 export interface SmartGlobOptions {
   // Pattern options
+  /**
+   * Directory to search. The natural name for it, and the one the hook's
+   * refusal message leads callers to pass; takes precedence over `cwd`.
+   */
+  path?: string;
   cwd?: string; // Working directory (default: process.cwd())
   absolute?: boolean; // Return absolute paths (default: false)
 
   // Filtering options
-  ignore?: string[]; // Patterns to ignore (default: node_modules, .git)
+  // Defaults are node_modules, .git, dist AND build -- the last two are real
+  // source directories in plenty of projects, so `metadata.ignoredMatches`
+  // reports whatever they withheld. Pass `[]` to search everything.
+  ignore?: string[];
   onlyFiles?: boolean; // Only return files, not directories (default: true)
   onlyDirectories?: boolean; // Only return directories (default: false)
 
@@ -68,7 +81,21 @@ export interface SmartGlobOptions {
   sortOrder?: 'asc' | 'desc'; // Sort direction (default: asc)
 
   // Cache options
-  useCache?: boolean; // Use cached results (default: true)
+  /**
+   * Serve a previously cached result for the same query.
+   *
+   * DEFAULT FALSE, and the default is the point. A cached search is keyed on
+   * the query, and a query does not describe the tree it ran against: create,
+   * edit or delete a matching file and the cached answer is simply wrong.
+   * Measured live -- a file created between two identical searches did not
+   * appear in the second.
+   *
+   * Enabling it says "nothing outside this server is changing these files",
+   * which only the caller can know. Writes made THROUGH this server are
+   * handled either way: they bump a generation counter that forms part of the
+   * key, so our own edits always invalidate.
+   */
+  useCache?: boolean;
   ttl?: number; // Cache TTL in seconds (default: 300)
 }
 
@@ -85,9 +112,35 @@ export interface SmartGlobResult {
     compressionRatio: number;
     duration: number;
     cacheHit: boolean;
+    /** Real matches withheld by the ignore patterns; absent when none were. */
+    ignoredMatches?: number;
+    /** Plain-language explanation of what was withheld and how to see it. */
+    ignoreNote?: string;
   };
   files?: Array<string | FileMetadata>;
   error?: string;
+}
+
+/**
+ * Never enumerated, in either walk, whatever the caller's ignore list says.
+ *
+ * `.git` ONLY, and the narrowness is the point. `node_modules` belongs in the
+ * caller's ignore list, not here: excluding it from BOTH walks makes their
+ * difference zero, which silently deletes the count that tells a caller what was
+ * withheld -- caught by an existing test that asserts a node_modules exclusion is
+ * still reported. `.git` is different because it was never reachable before
+ * `dot: true`; this restores the status quo rather than changing what is counted.
+ *
+ * With `dot: true` the comparison walk would otherwise descend into
+ * `.git/objects` -- unbounded on a
+ * real repository, and pure cost, since nobody's search was 'withheld' by git's
+ * object store.
+ */
+const ALWAYS_IGNORED = ['**/.git/**'];
+
+/** A caller's ignore list, plus the patterns neither walk may enumerate. */
+function withAlwaysIgnored(ignore: string[]): string[] {
+  return [...new Set([...ignore, ...ALWAYS_IGNORED])];
 }
 
 export class SmartGlobTool {
@@ -106,38 +159,71 @@ export class SmartGlobTool {
   ): Promise<SmartGlobResult> {
     const startTime = Date.now();
 
-    // Default options
-    const opts: Required<SmartGlobOptions> = {
-      cwd: options.cwd ?? process.cwd(),
-      absolute: options.absolute ?? false,
-      ignore: options.ignore ?? [
-        '**/node_modules/**',
-        '**/.git/**',
-        '**/dist/**',
-        '**/build/**',
-      ],
-      onlyFiles: options.onlyFiles ?? true,
-      onlyDirectories: options.onlyDirectories ?? false,
-      extensions: options.extensions ?? [],
-      excludeExtensions: options.excludeExtensions ?? [],
-      minSize: options.minSize ?? 0,
-      maxSize: options.maxSize ?? Infinity,
-      modifiedAfter: options.modifiedAfter ?? new Date(0),
-      modifiedBefore: options.modifiedBefore ?? new Date(8640000000000000), // Max date
-      includeMetadata: options.includeMetadata ?? false,
-      includeContent: options.includeContent ?? false,
-      maxContentSize: options.maxContentSize ?? 10240, // 10KB
-      limit: options.limit ?? Infinity,
-      offset: options.offset ?? 0,
-      sortBy: options.sortBy ?? 'path',
-      sortOrder: options.sortOrder ?? 'asc',
-      useCache: options.useCache ?? true,
-      ttl: options.ttl ?? 300,
-    };
-
+    // See smart-grep.ts: `path` was silently discarded, so a scoped search
+    // actually ran from the server's own launch directory. This tool did not
+    // crash on it -- it returned confident results from the wrong tree, which
+    // is the worse of the two failures.
+    //
+    // Assigning it to `cwd` then broke `path` naming a single FILE: a glob
+    // rooted at a file matches nothing, so the call returned success with an
+    // empty list. The scope resolves a file to its parent plus the file itself,
+    // and `limitToScopedFile` below keeps the result to that one file, since
+    // this tool's only filter is the caller's pattern.
     try {
+      const scope = resolveSearchScope(
+        options.path,
+        options.cwd,
+        process.cwd()
+      );
+
+      // Default options
+      const opts: Required<SmartGlobOptions> = {
+        cwd: scope.cwd,
+        path: options.path ?? '',
+        absolute: options.absolute ?? false,
+        // `dist` and `build` are conventions, not guarantees. Real projects keep
+        // real source in both -- AiDotNet.Tensors has two .csproj files under
+        // build/, and a search for '**/*.csproj' silently returned 16 of its 18.
+        // The hook DENIES the built-in Glob and sends the caller here, so a
+        // silent omission is not a smaller result set, it is the caller
+        // concluding their file does not exist.
+        //
+        // The defaults are kept, because they are right far more often than not.
+        // What is removed is the SILENCE: `ignoredMatches` below reports how many
+        // real matches these patterns withheld, so the omission is visible and
+        // the caller can pass their own `ignore` to see them.
+        ignore: options.ignore ?? [
+          '**/node_modules/**',
+          '**/.git/**',
+          '**/dist/**',
+          '**/build/**',
+        ],
+        onlyFiles: options.onlyFiles ?? true,
+        onlyDirectories: options.onlyDirectories ?? false,
+        extensions: options.extensions ?? [],
+        excludeExtensions: options.excludeExtensions ?? [],
+        minSize: options.minSize ?? 0,
+        maxSize: options.maxSize ?? Infinity,
+        modifiedAfter: options.modifiedAfter ?? new Date(0),
+        modifiedBefore: options.modifiedBefore ?? new Date(8640000000000000), // Max date
+        includeMetadata: options.includeMetadata ?? false,
+        includeContent: options.includeContent ?? false,
+        maxContentSize: options.maxContentSize ?? 10240, // 10KB
+        limit: options.limit ?? Infinity,
+        offset: options.offset ?? 0,
+        sortBy: options.sortBy ?? 'path',
+        sortOrder: options.sortOrder ?? 'asc',
+        useCache: options.useCache ?? false,
+        ttl: options.ttl ?? 300,
+      };
+
       // Check cache first
-      const cacheKey = generateCacheKey('glob', { pattern, options: opts });
+      const cacheKey = generateCacheKey('glob', {
+        pattern,
+        options: opts,
+        // Any write through this server invalidates every cached search.
+        fsGeneration: fsGeneration(),
+      });
 
       if (opts.useCache) {
         const cached = this.cache.get(cacheKey);
@@ -162,12 +248,78 @@ export class SmartGlobTool {
       }
 
       // Perform glob search
-      const matches = globSync(pattern, {
-        cwd: opts.cwd,
-        absolute: opts.absolute,
-        ignore: opts.ignore,
-        nodir: opts.onlyFiles,
-      });
+      //
+      // Narrowed to the scoped file when `path` named one -- the glob ran from
+      // that file's PARENT, so without this it would also return the parent's
+      // other matches and quietly widen the scope the caller asked for.
+      const matches = limitToScopedFile(
+        globSync(pattern, {
+          cwd: opts.cwd,
+          absolute: opts.absolute,
+          // ALWAYS_IGNORED REACHES THIS WALK TOO.
+          //
+          // It used to apply only to the comparison walk, so a caller-supplied
+          // ignore list left `.git` enumerated HERE and excluded THERE. The
+          // primary walk then returned more matches than the comparison, the
+          // difference went negative, and `ignoredMatches` clamped to zero --
+          // telling the caller nothing had been withheld while their own
+          // pattern was withholding a file. The two walks only mean anything
+          // relative to each other, so they have to be scoped identically.
+          ignore: withAlwaysIgnored(opts.ignore),
+          nodir: opts.onlyFiles,
+          // `.github/`, `.claude/`, `.husky/` and every dotfile are ordinary
+          // project content, but glob skips anything dot-prefixed unless told
+          // otherwise. Measured in a real checkout: ten .yml files existed, all
+          // under .github/workflows, and a repo-wide search returned ZERO while
+          // reporting success over 654 files searched. Exclusion is the ignore
+          // list's job -- .git and node_modules are still excluded by it.
+          dot: true,
+        }),
+        scope
+      );
+
+      // Whether the exclusions in force are OURS or the caller's -- the note
+      // below names them, and naming them wrongly misdirects anyone hunting a
+      // file that did not come back.
+      const usingDefaultIgnore = options.ignore === undefined;
+
+      // How many REAL matches the ignore patterns withheld. Turns a silent
+      // omission into a number the caller can act on.
+      //
+      // With `ignore: []` there is nothing to withhold and `matches` is
+      // already the unignored set, so the second walk would traverse the whole
+      // tree synchronously to rediscover a list we are holding -- pure cost on
+      // the exact call that opted out of filtering.
+      //
+      // BOTH WALKS ARE SCOPED THE SAME WAY. Narrowing only the first one made
+      // the difference between them look like suppressed matches: a file-scoped
+      // glob returned 1 while the comparison walk still covered the parent and
+      // returned 2, so the response reported that 1 file "matched but were
+      // excluded by the ignore patterns" when nothing had been excluded at all.
+      // A number invented to explain an absence is worse than no number.
+      const ignoredMatches =
+        opts.ignore.length === 0
+          ? 0
+          : Math.max(
+              0,
+              limitToScopedFile(
+                globSync(pattern, {
+                  cwd: opts.cwd,
+                  absolute: opts.absolute,
+                  nodir: opts.onlyFiles,
+                  // Same reason as above; both walks must agree.
+                  dot: true,
+                  // NOT an empty ignore list, now that `dot` is on. This walk
+                  // deliberately drops the caller's ignores to count what they
+                  // withheld -- but with dots visible that would enumerate
+                  // `.git/objects`, which on a real repository is enormous and
+                  // is pure cost: nobody's glob was "withheld" by git's object
+                  // store. Infrastructure stays excluded in both walks.
+                  ignore: ALWAYS_IGNORED,
+                }),
+                scope
+              ).length - matches.length
+            );
 
       // Filter and collect file info
       let files: Array<{ path: string; metadata?: FileMetadata }> = [];
@@ -282,18 +434,30 @@ export class SmartGlobTool {
         JSON.stringify(results)
       ).tokens;
 
-      // Estimate original tokens (if we had returned all content)
-      let originalTokens = resultTokens;
-      if (!opts.includeContent && !opts.includeMetadata) {
-        // Path-only mode: estimate content would be 50x more tokens
-        originalTokens = resultTokens * 50;
-      } else if (!opts.includeContent) {
-        // Metadata mode: estimate content would be 10x more tokens
-        originalTokens = resultTokens * 10;
-      }
+      // WHAT WAS ACTUALLY WITHHELD, not a multiplier.
+      //
+      // This used to report `resultTokens * 50` as the baseline in path-only
+      // mode -- so listing 2,400 files claimed to have saved 117,943 tokens
+      // without having read a single one. Nothing was read, so nothing about
+      // file CONTENT was saved; the 50x came from nowhere.
+      //
+      // A listing's real saving is what pagination and filtering kept out of
+      // the response: the paths that matched and were not returned. That is
+      // countable, so it is counted. When everything matched fits in the
+      // response, the honest answer is that nothing was saved.
+      const withheldPaths = files
+        .slice(opts.offset + paginatedFiles.length)
+        .map((f) => f.path);
+      const withheldTokens = withheldPaths.length
+        ? this.tokenCounter.count(JSON.stringify(withheldPaths)).tokens
+        : 0;
 
-      const tokensSaved = originalTokens - resultTokens;
-      const compressionRatio = resultTokens / originalTokens;
+      const originalTokens = resultTokens + withheldTokens;
+      const tokensSaved = withheldTokens;
+      // An honest baseline can now equal the result (nothing was withheld), so
+      // the ratio must not divide by zero or report a nonsense figure.
+      const compressionRatio =
+        originalTokens > 0 ? resultTokens / originalTokens : 1;
 
       // Build result
       const result: SmartGlobResult = {
@@ -309,6 +473,21 @@ export class SmartGlobTool {
           compressionRatio,
           duration: 0, // Will be set below
           cacheHit: false,
+          // Only present when something was actually withheld, so a normal
+          // search stays as quiet as it was.
+          ...(ignoredMatches > 0
+            ? {
+                ignoredMatches,
+                // "default" only when they ARE the defaults. A caller who
+                // passed their own ignore array was told their exclusions came
+                // from patterns they had just overridden, which sends anybody
+                // debugging a missing file to the wrong list.
+                ignoreNote:
+                  `${ignoredMatches} file(s) matched but were excluded by the ` +
+                  `${usingDefaultIgnore ? 'default' : 'configured'} ignore patterns ` +
+                  `(${opts.ignore.join(', ')}). Pass ignore: [] to include them.`,
+              }
+            : {}),
         },
         files: results,
       };
@@ -483,6 +662,11 @@ export const SMART_GLOB_TOOL_DEFINITION = {
         description:
           'Glob pattern to match files (e.g., "src/**/*.ts", "*.json")',
       },
+      path: {
+        type: 'string',
+        description:
+          'Directory to search. Preferred over cwd; without it the search falls back to the server process directory rather than your project.',
+      },
       cwd: {
         type: 'string',
         description: 'Working directory for glob search',
@@ -511,6 +695,90 @@ export const SMART_GLOB_TOOL_DEFINITION = {
         enum: ['name', 'size', 'modified', 'path'],
         description: 'Field to sort results by',
         default: 'path',
+      },
+      // DECLARED BECAUSE THEY ARE ACCEPTED. The server spreads the caller's whole
+      // argument object into options, so these already worked and were simply
+      // undiscoverable -- the same gap that let `path` be dropped silently and every
+      // "scoped" search run from the wrong directory.
+      absolute: {
+        type: 'boolean',
+        description:
+          'Return absolute paths instead of paths relative to the search root',
+        default: false,
+      },
+      ignore: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Glob patterns to skip. Defaults exclude node_modules, .git, dist and build -- the last two hold real source in some projects, so metadata.ignoredMatches reports what they withheld. Pass [] to search everything.',
+        default: [
+          '**/node_modules/**',
+          '**/.git/**',
+          '**/dist/**',
+          '**/build/**',
+        ],
+      },
+      onlyFiles: {
+        type: 'boolean',
+        description: 'Return files only, excluding directories',
+        default: true,
+      },
+      onlyDirectories: {
+        type: 'boolean',
+        description: 'Return directories only',
+        default: false,
+      },
+      excludeExtensions: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Skip files with these extensions',
+      },
+      minSize: {
+        type: 'number',
+        description: 'Skip files smaller than this many bytes',
+      },
+      maxSize: {
+        type: 'number',
+        description: 'Skip files larger than this many bytes',
+      },
+      modifiedAfter: {
+        type: 'string',
+        format: 'date-time',
+        description: 'Only files modified after this ISO-8601 timestamp',
+      },
+      modifiedBefore: {
+        type: 'string',
+        format: 'date-time',
+        description: 'Only files modified before this ISO-8601 timestamp',
+      },
+      maxContentSize: {
+        type: 'number',
+        description:
+          'Largest file, in bytes, for which includeContent returns content',
+        default: 10240,
+      },
+      offset: {
+        type: 'number',
+        description:
+          'Skip this many results before returning any; use with limit to page',
+        default: 0,
+      },
+      sortOrder: {
+        type: 'string',
+        enum: ['asc', 'desc'],
+        description: 'Sort direction for sortBy',
+        default: 'asc',
+      },
+      useCache: {
+        type: 'boolean',
+        description:
+          'Serve a previously cached result for the same query. Off by default: the key describes the query, not the tree, so a file created between two identical searches will not appear.',
+        default: false,
+      },
+      ttl: {
+        type: 'number',
+        description: 'Cache lifetime in seconds, when useCache is on',
+        default: 300,
       },
     },
     required: ['pattern'],

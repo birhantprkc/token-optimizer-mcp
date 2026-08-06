@@ -188,11 +188,11 @@ export class SmartMergeTool {
 
           // Estimate original tokens (full git status + diff output)
           if (opts.summaryOnly) {
-            originalTokens = resultTokens * 50; // Summary vs full output
+            originalTokens = resultTokens; // measured, not assumed: a multiplier here would invent a saving
           } else if (opts.conflictsOnly) {
-            originalTokens = resultTokens * 10; // Conflicts only vs full diff
+            originalTokens = resultTokens; // measured, not assumed: a multiplier here would invent a saving
           } else {
-            originalTokens = resultTokens * 5; // Structured vs raw output
+            originalTokens = resultTokens; // measured, not assumed: a multiplier here would invent a saving
           }
           break;
 
@@ -204,7 +204,7 @@ export class SmartMergeTool {
           resultTokens = this.tokenCounter.count(
             JSON.stringify(mergeResult)
           ).tokens;
-          originalTokens = resultTokens * 8; // Structured result vs full merge output
+          originalTokens = resultTokens; // measured, not assumed: a multiplier here would invent a saving
           break;
 
         case 'abort':
@@ -219,7 +219,7 @@ export class SmartMergeTool {
           resultTokens = this.tokenCounter.count(
             JSON.stringify(mergeResult)
           ).tokens;
-          originalTokens = resultTokens * 5;
+          originalTokens = resultTokens; // measured, not assumed: a multiplier here would invent a saving
           break;
 
         case 'continue':
@@ -227,7 +227,7 @@ export class SmartMergeTool {
           resultTokens = this.tokenCounter.count(
             JSON.stringify(mergeResult)
           ).tokens;
-          originalTokens = resultTokens * 8;
+          originalTokens = resultTokens; // measured, not assumed: a multiplier here would invent a saving
           break;
 
         default:
@@ -841,6 +841,30 @@ export const SMART_MERGE_TOOL_DEFINITION = {
       maxConflicts: {
         type: 'number',
         description: 'Maximum conflicts to return',
+      },
+      // DECLARED BECAUSE THEY ARE ACCEPTED: the server spreads the caller's whole
+      // argument object into options, so these worked while being undiscoverable.
+      strategyOption: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Strategy options passed through to git, for example ["ignore-space-change"]',
+      },
+      resolveUsing: {
+        type: 'string',
+        enum: ['ours', 'theirs'],
+        description:
+          'Resolve every conflict from one side. Destructive: the other side is discarded without review.',
+      },
+      useCache: {
+        type: 'boolean',
+        description: 'Serve a previously cached result for the same query',
+        default: false,
+      },
+      ttl: {
+        type: 'number',
+        description: 'Cache lifetime in seconds, when useCache is on',
+        default: 300,
       },
     },
   },

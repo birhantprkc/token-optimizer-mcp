@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Custom Widget Tool - 88% token reduction through template caching and widget definition compression
  *
  * Features:
@@ -12,9 +12,10 @@
  */
 
 import { CacheEngine } from '../../core/cache-engine.js';
+import { readCompressedJson } from '../../utils/cache-helper.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import { MetricsCollector } from '../../core/metrics.js';
-import { compress, decompress } from '../shared/compression-utils.js';
+import { compress } from '../shared/compression-utils.js';
 import { createHash } from 'crypto';
 
 // Type definitions
@@ -224,15 +225,15 @@ export class CustomWidget {
         this.isReadOnlyOperation(options.operation)
       ) {
         const cached = this.cache.get(cacheKey);
-        if (cached) {
-          const decompressed = decompress(
-            Buffer.from(cached, 'base64'),
-            'gzip'
-          );
-          const cachedResult = JSON.parse(
-            decompressed.toString()
-          ) as CustomWidgetResult;
-
+        // An unreadable entry is a MISS, not a failure -- see
+        // readCompressedJson in utils/cache-helper.ts. A cache must never
+        // be able to make a correct answer impossible.
+        const cachedResult = readCompressedJson<CustomWidgetResult>(
+          this.cache,
+          cached,
+          cacheKey
+        );
+        if (cachedResult) {
           const tokensSaved = this.tokenCounter.count(
             JSON.stringify(cachedResult)
           ).tokens;
@@ -641,15 +642,19 @@ export class CustomWidget {
     const schema =
       type === 'all' ? this.getAllSchemas() : this.getSchemaForType(type);
 
-    // Schema is static and highly cacheable (98% reduction)
-    const originalSize = this.tokenCounter.count(JSON.stringify(schema)).tokens;
-    const tokensSaved = Math.floor(originalSize * 0.98);
+    // NOTHING IS SAVED BY RETURNING A SCHEMA.
+    //
+    // This measured the schema and then claimed 98% of it as `tokensSaved`,
+    // which inverts the meaning: that figure is what the response COSTS, not
+    // what it avoided. Returning content is not a saving on that same content.
+    const tokensUsed = this.tokenCounter.count(JSON.stringify(schema)).tokens;
 
     return {
       success: true,
       data: { schema },
       metadata: {
-        tokensSaved,
+        tokensUsed,
+        tokensSaved: 0,
         cacheHit: false,
       },
     };
@@ -1190,10 +1195,127 @@ export const CUSTOM_WIDGET_TOOL_DEFINITION = {
       config: {
         type: 'object',
         description: 'Widget configuration',
+        // Declared in full. This was `{ type: 'object' }` with no properties,
+        // so the published contract described none of the 21 fields a widget
+        // actually accepts -- a caller had no way to learn them, and any
+        // misspelling passed validation and vanished.
+        //
+        // Every field is optional in WidgetConfig because which ones apply
+        // depends on the widget type, so there is no `required` list here.
+        properties: {
+          chartType: {
+            type: 'string',
+            enum: ['line', 'bar', 'pie', 'scatter', 'area', 'radar'],
+          },
+          // Inlined rather than $ref'd: this schema declares no $defs, and a
+          // reference into a section that does not exist resolves to nothing --
+          // a validator either errors or silently accepts anything.
+          xAxis: {
+            type: 'object',
+            properties: {
+              field: { type: 'string' },
+              label: { type: 'string' },
+              format: { type: 'string' },
+            },
+            required: ['field'],
+          },
+          yAxis: {
+            type: 'object',
+            properties: {
+              field: { type: 'string' },
+              label: { type: 'string' },
+              format: { type: 'string' },
+            },
+            required: ['field'],
+          },
+          series: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                field: { type: 'string' },
+                label: { type: 'string' },
+                color: { type: 'string' },
+              },
+              required: ['field'],
+            },
+          },
+          metric: { type: 'string' },
+          threshold: {
+            type: 'object',
+            properties: {
+              warning: { type: 'number' },
+              critical: { type: 'number' },
+            },
+          },
+          format: { type: 'string' },
+          sparkline: { type: 'boolean' },
+          columns: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                field: { type: 'string' },
+                label: { type: 'string' },
+                format: { type: 'string' },
+                sortable: { type: 'boolean' },
+              },
+              required: ['field', 'label'],
+            },
+          },
+          pagination: {
+            type: 'object',
+            properties: {
+              pageSize: { type: 'number' },
+              showSizeChanger: { type: 'boolean' },
+            },
+            required: ['pageSize'],
+          },
+          min: { type: 'number' },
+          max: { type: 'number' },
+          ranges: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                min: { type: 'number' },
+                max: { type: 'number' },
+                color: { type: 'string' },
+                label: { type: 'string' },
+              },
+              required: ['min', 'max', 'color'],
+            },
+          },
+          html: { type: 'string' },
+          css: { type: 'string' },
+          javascript: { type: 'string' },
+          title: { type: 'string' },
+          description: { type: 'string' },
+          refreshInterval: { type: 'number' },
+          height: { type: 'number' },
+          width: { type: 'number' },
+        },
       },
       dataSource: {
         type: 'object',
         description: 'Data source configuration',
+        properties: {
+          type: {
+            type: 'string',
+            enum: ['static', 'api', 'query', 'mcp-tool'],
+          },
+          data: {
+            description: 'Inline data, for type "static". Any JSON value.',
+          },
+          url: { type: 'string' },
+          query: { type: 'string' },
+          tool: { type: 'string' },
+          transform: {
+            type: 'string',
+            description: 'JavaScript expression applied to the fetched data',
+          },
+        },
+        required: ['type'],
       },
       templateName: {
         type: 'string',

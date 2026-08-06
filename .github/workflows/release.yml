@@ -53,6 +53,7 @@ jobs:
           # config-file / manifest-file default to the repo-root files:
           #   release-please-config.json + .release-please-manifest.json
 
+
   # 2) On an actual release, build and publish to npm.
   publish-npm:
     name: Publish to npm
@@ -82,6 +83,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # VERIFY, AND DO NOT REPAIR FIRST. Regenerating before the check made the check
+      # meaningless: `sync:hooks` rewrote the generated files, so `sync:hooks:check`
+      # then compared the repaired tree against itself and passed even when the RELEASED
+      # TAG contained stale generated output. The publish could ship files that did not
+      # match the tag it claims to be built from, which is the one thing the
+      # provenance attestation is supposed to rule out.
+      #
+      # The repair existed because a release used to knock the pinned specs out of step
+      # every time. It no longer can: the specs say `@latest`, which does not change
+      # when package.json does. With nothing left to repair, the regeneration only
+      # masked real generator drift.
+      #
+      # Generated output must therefore be committed before the tag is cut. The
+      # `generated-artifacts` job in quality-gates.yml runs this same check on every
+      # push, so drift is caught long before a release.
+      - name: Verify generated configs match their generators
+        run: npm run sync:hooks:check
+
       - name: Build project
         run: npm run build
 
@@ -92,6 +111,19 @@ jobs:
             exit 1
           fi
           echo "Build artifacts verified successfully"
+
+      # Offline verification, alongside (not instead of) the provenance
+      # attestation the publish below produces. Generated from the built tree so
+      # it hashes exactly what ships.
+      - name: Generate CHECKSUMS.sha256
+        run: node scripts/checksums.mjs
+
+      - name: Attach CHECKSUMS.sha256 to the release
+        if: ${{ needs.release-please.outputs.tag_name != '' }}
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" CHECKSUMS.sha256 --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
 
       - name: Publish to npm (provenance; OIDC trusted publishing or NPM_TOKEN)
         # If a trusted publisher is configured on npmjs.com, npm uses OIDC and
