@@ -20,7 +20,7 @@ import {
   gapDistribution, keepWarmDecision, ttlTier, tripwire, shouldKeepWarm,
   recordRefreshOutcome, TIERS, TRIPWIRE_MIN,
 } from '../../hooks-core/keepwarm.mjs';
-import { record } from '../../hooks-core/metrics.mjs';
+import { record, readMetrics } from '../../hooks-core/metrics.mjs';
 import { policyText } from '../../hooks-core/adapter.mjs';
 
 let workspace;
@@ -268,5 +268,195 @@ describe('our own contribution to the prefix is stable by construction', () => {
       { id: 'settled', fresh: false },
     ]);
     expect(ordered.map((i) => i.id)).toEqual(['settled', 'fresh']);
+  });
+});
+
+// --- the two keep-warm ledgers must agree ------------------------------------------
+
+describe('keep-warm scores refreshes with the model it bought them under', () => {
+  const READ = 0.1;
+
+  test('a realised outcome matches what keepWarmDecision predicted', () => {
+    // THE DEFECT: keepWarmDecision prices a refresh as a PING that READS the prefix
+    // (costOfPing = prefixTokens * READ_MULTIPLIER) and warns in its own comment that pricing it
+    // as a write "overstates its cost by more than twelvefold". recordRefreshOutcome then scored
+    // the very same refresh as a re-WRITE. The two disagreed in the direction that kills the
+    // feature: mean realised was negative below a 27.8% hit rate while the decision's model makes
+    // the ping pay above 8.7%, so for any project in that band the tripwire accumulated a negative
+    // balance and permanently disabled a policy that was genuinely paying -- reporting it as
+    // "keep-warm has lost N tokens ... stopping". The backstop fired on its own accounting error.
+    const prefixTokens = 10_000;
+    const tier = TIERS[0];
+
+    recordRefreshOutcome(dir, { tier: tier.name, prefixTokens, hit: true });
+    recordRefreshOutcome(dir, { tier: tier.name, prefixTokens, hit: false });
+
+    const rows = readMetrics(dir).filter((e) => e.kind === 'keepwarm' && e.action === 'outcome');
+    const hit = rows.find((r) => r.hit);
+    const miss = rows.find((r) => !r.hit);
+
+    // Exactly the decision's arithmetic: saving-if-used minus the cost of the ping, and on a miss
+    // the cost of the ping alone.
+    const costOfPing = prefixTokens * READ;
+    const savingIfUsed = prefixTokens * (tier.writeMultiplier - READ);
+    expect(hit.realised).toBe(Math.round(savingIfUsed - costOfPing));
+    expect(miss.realised).toBe(Math.round(-costOfPing));
+  });
+
+  test('the tripwire does not stop a policy the decision says is paying', () => {
+    // THE PROPERTY, exercised through both production functions rather than restated as local
+    // arithmetic. A hit rate the decision calls profitable must not accumulate a negative realised
+    // balance in the tripwire. At the old pricing the two disagreed between 8.7% and 27.8%, so
+    // every rate in that band tripped the wire on a policy that was genuinely paying.
+    const prefixTokens = 10_000;
+    const hitRate = 0.15; // inside the old disagreement band
+
+    // What the decision thinks of a gap profile with that much of its mass in the refresh window.
+    const gaps = {
+      probabilityWithin: (ms) => (ms <= TIERS[0].ms ? 0 : ms <= TIERS[0].ms * 2 ? hitRate : 1),
+    };
+    expect(keepWarmDecision({ prefixTokens, gaps }).action).toBe('refresh');
+
+    // Now record real outcomes at that rate and ask the tripwire, which reads them back.
+    const refreshes = 20;
+    for (let i = 0; i < refreshes; i++) {
+      recordRefreshOutcome(dir, {
+        tier: TIERS[0].name, prefixTokens, hit: i < Math.round(refreshes * hitRate),
+      });
+    }
+    const trip = tripwire(dir);
+    expect(trip.observed).toBeGreaterThanOrEqual(TRIPWIRE_MIN);
+    expect(trip.tripped).toBe(false);
+    expect(trip.realised).toBeGreaterThan(0);
+  });
+
+  test('and it still stops one that is genuinely losing', () => {
+    // The guard must not have been turned into a rubber stamp: below the true break-even the wire
+    // still fires, which is the whole reason it exists.
+    for (let i = 0; i < 20; i++) {
+      recordRefreshOutcome(dir, { tier: TIERS[0].name, prefixTokens: 10_000, hit: false });
+    }
+    const trip = tripwire(dir);
+    expect(trip.tripped).toBe(true);
+    expect(trip.realised).toBeLessThan(0);
+  });
+});
+
+describe('keep-warm never returns a verdict that contradicts its own reason', () => {
+  /** Seeds events `gapMs` apart so the distribution is known. Same helper as above, re-scoped. */
+  const seedGaps = (gapMs, count = 20) => {
+    const base = Date.now() - count * gapMs;
+    const path = join(dir, 'metrics.jsonl');
+    record(dir, { kind: 'seed' });
+    const lines = Array.from({ length: count }, (_, i) => JSON.stringify({ kind: 'read', at: base + i * gapMs }));
+    writeFileSync(path, lines.join('\n') + '\n');
+  };
+
+  test('a refresh that pays is not rewritten into a skip', () => {
+    // ttlTier asks whether holding a cache beats not caching; keepWarmDecision asks whether ONE
+    // ping beats letting the entry lapse. They can legitimately disagree, and coercing the second
+    // to 'skip' while keeping its reason string produced `{ action: 'skip', reason: '...expected
+    // gain 130 tokens' }` -- a refusal justified by a gain.
+    // Driven through shouldKeepWarm with real recorded events, not a hand-built verdict -- the
+    // first version of this test constructed the object itself and so could pass while the
+    // production path regressed.
+    //
+    // A MIXED distribution, because a uniform one cannot produce the disagreement. Uniform 9m gaps
+    // make the 1h tier cheap (every gap lands inside it), so ttlTier pays and there is nothing to
+    // disagree about. What is needed is a profile where NO tier pays across the session as a whole
+    // -- most gaps are hours long -- while a real slice still sits in the 5m-to-10m window that one
+    // ping reaches. 30% at seven minutes, 70% at three hours.
+    const mixed = [];
+    let at = Date.now() - 300 * 60 * 1000;
+    for (let i = 0; i < 30; i++) {
+      at += (i % 10 < 3 ? 7 : 180) * 60 * 1000;
+      mixed.push(JSON.stringify({ kind: 'read', at }));
+    }
+    record(dir, { kind: 'seed' });
+    writeFileSync(join(dir, 'metrics.jsonl'), `${mixed.join('\n')}\n`);
+
+    const gaps = gapDistribution(dir);
+    expect(ttlTier({ prefixTokens: 47_000, gaps })).toBeNull();
+    expect(keepWarmDecision({ prefixTokens: 47_000, gaps }).action).toBe('refresh');
+
+    const verdict = shouldKeepWarm(dir, { prefixTokens: 47_000 });
+    expect(verdict.action).toBe('refresh');
+    // And the invariant that failed before: no verdict may contradict its own stated reason.
+    if (/expected gain/.test(verdict.reason || '')) expect(verdict.action).not.toBe('skip');
+    if (/expected loss/.test(verdict.reason || '')) expect(verdict.action).not.toBe('refresh');
+  });
+
+  test('a non-finite turn count cannot produce a refresh built from NaN', () => {
+    // Math.max(1, NaN) is NaN, so perTurn was NaN, `NaN >= 1` was false, and the guard PASSED --
+    // returning action:'refresh' with expectedValue NaN and "NaN% of gaps land inside 5m".
+    const gaps = { probabilityWithin: () => 0.9 };
+    const out = ttlTier({ prefixTokens: 10_000, gaps, turnsPerSession: Number.NaN });
+    if (out) {
+      expect(Number.isFinite(out.expectedValue)).toBe(true);
+      expect(Number.isFinite(out.expectedCostPerTurn)).toBe(true);
+      expect(out.reason).not.toMatch(/NaN/);
+    }
+  });
+});
+
+describe('the backstop can actually reach its own threshold', () => {
+  test('outcomes survive a firehose long enough to have evicted them', () => {
+    // THE DEFECT: tripwire read through readMetrics, whose window is 5000 events and 2 MB. There
+    // is one keepwarm outcome per refresh, in a log dominated by reads and captures, so the ten
+    // TRIPWIRE_MIN demands aged out before the tenth was written. It returned
+    // "only N/10 refreshes observed" for the life of the project, and shouldKeepWarm could never
+    // be vetoed -- a guard that cannot reach its own threshold is not a guard.
+    for (let i = 0; i < TRIPWIRE_MIN + 2; i++) {
+      recordRefreshOutcome(dir, { tier: TIERS[0].name, prefixTokens: 10_000, hit: false });
+    }
+    // Bury them under more events than the window will hold.
+    for (let i = 0; i < 5_200; i++) record(dir, { kind: 'read', anchor: `/n${i}.ts`, tokens: 10 });
+
+    const windowed = readMetrics(dir).filter((e) => e.kind === 'keepwarm');
+    expect(windowed.length).toBeLessThan(TRIPWIRE_MIN); // the window really did evict them
+
+    const trip = tripwire(dir);
+    expect(trip.observed).toBe(TRIPWIRE_MIN + 2);
+    expect(trip.tripped).toBe(true);
+  });
+});
+
+describe('a gap between two sessions is not a gap between turns', () => {
+  test('an overnight boundary does not enter the distribution', () => {
+    // THE DEFECT: every timestamp in the log was sorted and differenced, so the interval between
+    // the last event of one session and the first of the next -- routinely sixteen hours -- was
+    // counted as a turn gap. That dominated p90/p99 and diluted probabilityWithin in the
+    // conservative direction, so ttlTier returned "neither tier pays" on projects where it would
+    // have paid. Silent, because the bias only ever declines to act.
+    const base = Date.now() - 48 * 60 * 60 * 1000;
+    const events = [];
+    for (let s = 0; s < 2; s++) {
+      for (let i = 0; i < 6; i++) {
+        events.push({ kind: 'read', sessionId: `s${s}`, at: base + s * 24 * 3600_000 + i * 60_000 });
+      }
+    }
+    record(dir, { kind: 'seed' });
+    writeFileSync(join(dir, 'metrics.jsonl'), `${events.map((e) => JSON.stringify(e)).join('\n')}\n`);
+
+    const gaps = gapDistribution(dir);
+    expect(gaps).not.toBeNull();
+    // Ten one-minute gaps within the two sessions, and no 24-hour one between them.
+    expect(gaps.count).toBe(10);
+    expect(gaps.p99).toBeLessThan(2 * 60_000);
+  });
+
+  test('a long gap INSIDE a session is kept, because it is real evidence', () => {
+    // Dropping these would bias the answer the other way -- making keep-warm look better than it
+    // is, which is the direction this project cares about most.
+    const base = Date.now() - 10 * 60 * 60 * 1000;
+    const events = Array.from({ length: 8 }, (_, i) => ({
+      kind: 'read', sessionId: 'one', at: base + i * 90 * 60_000,
+    }));
+    record(dir, { kind: 'seed' });
+    writeFileSync(join(dir, 'metrics.jsonl'), `${events.map((e) => JSON.stringify(e)).join('\n')}\n`);
+
+    const gaps = gapDistribution(dir);
+    expect(gaps.median).toBeGreaterThan(60 * 60_000);
+    expect(ttlTier({ prefixTokens: 47_000, gaps })).toBeNull(); // and it correctly declines
   });
 });

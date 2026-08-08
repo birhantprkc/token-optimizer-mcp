@@ -272,7 +272,7 @@ function statePath(sessionId, agent) {
 
 /** A usable state object, whatever was on disk. */
 function emptyState() {
-  return { seen: {}, denied: {}, injected: [], actCounts: {} };
+  return { seen: {}, denied: {}, injected: [], actCounts: {}, forecast: null, edits: 0, editedFiles: [], recordingNudged: false };
 }
 
 /**
@@ -312,6 +312,28 @@ export function loadState(sessionId, agent) {
         parsed.actCounts && typeof parsed.actCounts === 'object' && !Array.isArray(parsed.actCounts)
           ? parsed.actCounts
           : {},
+      // THE SAME REASON A THIRD TIME. The forecast throttle records when the panel was last
+      // computed and what runway it last SHOWED, and both are meaningless within a single hook
+      // process -- every tool call is a new one. Dropped here, `checkedAt` would reset on every
+      // call and the panel would rebuild itself, transcript parse and all, on each tool use; and
+      // `shown` would reset, so worthSurfacing would compare against nothing and re-interrupt with
+      // the same runway forever.
+      // AND ITS TIMESTAMP MUST BE A NUMBER. The shape check alone accepted `checkedAt: "1700"`,
+      // and both the throttle comparison and the merge below order by it -- so a persisted numeric
+      // STRING compares by lexicographic coercion and can beat a later real timestamp, freezing
+      // the throttle open or shut. Same class as every other field validated here: a value that
+      // parsed is not a value that means anything.
+      forecast:
+        parsed.forecast && typeof parsed.forecast === 'object' && !Array.isArray(parsed.forecast)
+          && Number.isFinite(parsed.forecast.checkedAt)
+          ? parsed.forecast
+          : null,
+      // THE SAME REASON AS EVERY FIELD ABOVE. Every tool call is a separate hook process, so a
+      // counter not carried through here resets to zero on each one and can never reach a
+      // threshold -- which is exactly how the act counter came to sit at one forever.
+      edits: Number.isFinite(parsed.edits) ? parsed.edits : 0,
+      editedFiles: Array.isArray(parsed.editedFiles) ? parsed.editedFiles : [],
+      recordingNudged: parsed.recordingNudged === true,
     };
   } catch {
     return emptyState();
@@ -382,6 +404,26 @@ export function saveState(sessionId, state, agent) {
           out[k] = Math.max(Number(out[k]) || 0, Number(v) || 0);
         }
         return out;
+      })(),
+      // LATEST CHECK WINS, which is the opposite direction from the fields above and correct for
+      // this one. `seen`, `denied`, `injected` and `actCounts` are all append-only, so a union or
+      // a max is the safe merge. The forecast throttle is a POINT IN TIME: taking the older of two
+      // concurrent checks would re-open the window and let the panel be rebuilt immediately, which
+      // is the cost the throttle exists to bound.
+      // HIGHEST WINS for the edit count, for the same concurrency reason as actCounts: two hook
+      // processes each read, each increment, and last-writer would lose one. Monotonic beats
+      // exact here -- undercounting delays a nudge, overcounting invents one.
+      edits: Math.max(Number(current.edits) || 0, Number(state.edits) || 0),
+      editedFiles: [...new Set([...(state.editedFiles || []), ...(current.editedFiles || [])])].slice(0, 20),
+      // ONCE SET, STAYS SET. A nudge that can un-fire is a nudge that repeats.
+      recordingNudged: Boolean(current.recordingNudged || state.recordingNudged),
+      forecast: (() => {
+        const mine = state.forecast || null;
+        const theirs = current.forecast || null;
+        const stamp = (f) => (Number.isFinite(f?.checkedAt) ? f.checkedAt : null);
+        if (stamp(mine) === null) return theirs;
+        if (stamp(theirs) === null) return mine;
+        return stamp(mine) >= stamp(theirs) ? mine : theirs;
       })(),
     };
 

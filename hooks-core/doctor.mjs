@@ -92,7 +92,14 @@ export function detectInstall({ pluginsDir, root } = {}) {
   if (record) {
     return {
       method: 'plugin',
-      hooksDir: pluginHooks && existsSync(pluginHooks) ? pluginHooks : packageHooks,
+      // AND IT MUST NOT FALL BACK TO THE PACKAGE COPY. plugin/hooks ships with
+      // every npm install (it is in package.json `files`), so substituting it
+      // here makes the checklist and the enforcement probe pass against a build
+      // Claude Code is not loading -- it loads from installPath, which is gone.
+      // The header records this exact defect as already fixed once: "The
+      // enforcement probe passed -- for a build that was not running." Point at
+      // where the hooks are supposed to be and let the checks fail loudly.
+      hooksDir: pluginHooks ?? packageHooks,
       installPath: record.installPath ?? null,
       installedVersion,
       availableVersion,
@@ -137,10 +144,13 @@ function hooksDirFor({ hooksDir, install, root }) {
  * and then fixed only its own half, the once-per-session Stop notice. A
  * systemMessage at Stop is easy to miss; the doctor is where someone goes to ask.
  *
- * This does NOT judge the default. Opting in costs a model call and sends a
- * digest off the machine, so requiring consent is right. The defect is that the
- * state was invisible, which let a user believe findings were accumulating when
- * they could not.
+ * THE DEFAULT HAS SINCE BEEN JUDGED, and reversed. This used to say that requiring consent was
+ * right and that only the invisibility was the defect. Measured again on a machine running this
+ * for weeks: 340 read events in one project's graph, 48 in another, and ZERO findings, ZERO
+ * harvests, ZERO injections in either. A default that nobody discovers is not a conservative
+ * default, it is a dead feature -- and everything downstream of the harvest is inert without it.
+ * Extraction is now on unless turned off, so this check reports a MISSING CREDENTIAL as the
+ * blocking case and a deliberate opt-out as a choice rather than a fault.
  */
 export function probeHarvest() {
   const mode = harvestMode();
@@ -153,24 +163,25 @@ export function probeHarvest() {
     return [ok('finding extraction is on', 'local endpoint -- free and private')];
   }
   if (mode === 'remote') {
-    return [ok('finding extraction is on', 'opted in, with a credential')];
+    return [ok('finding extraction is on',
+      'on by default, with a credential -- a digest of paths, commands and conclusions, never ' +
+      'file contents, is sent to extract findings. TOKEN_OPTIMIZER_HARVEST=0 turns it off')];
   }
 
+  // THE COMMON BLOCKING CASE now that extraction is on by default: wanted, but unable to run.
   if (mode === 'off:no-key') {
     return [bad('finding extraction is on',
-      'opted in, but there is no credential to call a model with',
+      'on, but there is no credential to call a model with -- so the graph will keep collecting ' +
+      'files and symbols and never a finding, a lesson or a correction',
       'set TOKEN_OPTIMIZER_API_KEY, or point TOKEN_OPTIMIZER_HARVEST_ENDPOINT at a ' +
-      'local model to run it without one')];
+      'local model to run it free and without one')];
   }
 
-  // off:not-opted-in
-  return [bad('finding extraction is on',
-    'off -- the graph will keep collecting files and symbols, but never a finding, ' +
-    'a lesson or a correction',
-    'point TOKEN_OPTIMIZER_HARVEST_ENDPOINT at a local model to run it free and ' +
-    'private, or set TOKEN_OPTIMIZER_HARVEST=1 with a credential to use a remote ' +
-    'one (that spends money and sends a digest of paths, commands and conclusions ' +
-    '-- never file contents -- off this machine)')];
+  // off:opted-out -- a deliberate choice, reported as one. Nagging about a setting somebody chose
+  // is how a diagnostic gets ignored, and the point of this check is that it is worth reading.
+  return [ok('finding extraction is on',
+    'off by your choice (TOKEN_OPTIMIZER_HARVEST is set to a false value) -- the graph will ' +
+    'collect files and symbols but no findings, lessons or corrections')];
 }
 
 export function probeVersion({ install }) {
@@ -202,8 +213,10 @@ function probe(binary, payload, { timeoutMs = 8000, cwd } = {}) {
       stdio: ['pipe', 'pipe', 'ignore'],
     });
   } catch (error) {
-    // A hook that exits non-zero with output still told us something.
-    return error?.stdout ?? null;
+    // A hook that exits non-zero WITH OUTPUT still told us something. One that
+    // timed out, was killed, or never spawned told us nothing -- and null has to
+    // mean exactly that, because an empty string is a legitimate "allowed".
+    return error?.stdout || null;
   }
 }
 
@@ -324,11 +337,19 @@ export function probeEnforcement({ root, workspace, hooksDir, install }) {
     const allowed = probe(binary, {
       tool_name: 'Read', tool_input: { file_path: small }, cwd: workspace, session_id: probeId,
     });
-    const allowedOk = !allowed || !allowed.includes('deny');
+    // `allowed === null` is "the probe never ran", NOT "the hook allowed it".
+    // allow() writes nothing and exits 0, so '' is a legitimate allow -- but null
+    // is a spawn failure, an EPERM, or a timeout, and reporting a pass there is a
+    // green tick produced by an absent measurement. A hook that hangs on every
+    // small read is a catastrophic install, and this check used to call it fine.
+    const allowedOk = allowed !== null && !allowed.includes('deny');
     checks.push(allowedOk
       ? ok('small reads are left alone', 'no refusal, as intended')
-      : bad('small reads are left alone', 'the hook refused a tiny file',
-        'a hook that refuses everything is as broken as one that refuses nothing -- report this'));
+      : bad('small reads are left alone',
+        allowed === null
+          ? 'the hook produced no result at all -- it crashed, hung past the timeout, or could not be spawned'
+          : 'the hook refused a tiny file',
+        'a hook that refuses everything, or answers nothing, is as broken as one that refuses nothing -- report this'));
   } finally {
     for (const path of [big, small]) {
       try { unlinkSync(path); } catch { /* best effort */ }
@@ -345,7 +366,21 @@ export function probeSessionStart({ root, workspace, hooksDir, install }) {
     return [bad('session-start emits the policy', 'binary missing', 'reinstall the package')];
   }
 
+  // probeEnforcement normally creates this, but it returns early when the router
+  // binary is missing -- before its own mkdirSync -- and a cwd that does not
+  // exist makes the SPAWN fail rather than the hook. Do not depend on another
+  // check having run first.
+  mkdirSync(workspace, { recursive: true });
   const out = probe(binary, {}, { cwd: workspace });
+  // JSON.parse(null) coerces to the string 'null' and RETURNS null rather than
+  // throwing, so without this the never-ran case fell past the catch written for
+  // it and reported 'ran, but produced no policy text' -- sending the user after
+  // TOKEN_OPTIMIZER_MODE for what is a spawn failure.
+  if (out === null) {
+    return [bad('session-start emits the policy',
+      'the hook produced no output at all -- it did not run',
+      'reinstall the package; the binary is present but could not be executed')];
+  }
   try {
     const parsed = JSON.parse(out);
     const context = parsed?.hookSpecificOutput?.additionalContext || '';
@@ -457,6 +492,8 @@ export function diagnose({
 
   const failed = checks.filter((c) => !c.pass);
   return {
+    // Carried so the report can speak about the file that was examined.
+    settingsPath: settingsPath ?? null,
     checks,
     passed: checks.length - failed.length,
     total: checks.length,
@@ -472,7 +509,12 @@ export function renderDiagnosis(result) {
     (check.pass || !check.remedy ? '' : `\n          fix: ${check.remedy}`));
 
   const residueNote = [];
-  const settings = process.env.TOKEN_OPTIMIZER_SETTINGS;
+  // The path diagnose ACTUALLY EXAMINED. Reading the env override here meant the
+  // residue note printed for nobody who had not set one -- that is, almost
+  // everybody, since both callers compute a default. It is also the only line
+  // that covers settings entries at all: removalPlan handles manifest-recorded
+  // files and nothing else.
+  const settings = result.settingsPath || process.env.TOKEN_OPTIMIZER_SETTINGS;
   if (settings) {
     const found = residue(settings);
     residueNote.push('', found.clean

@@ -24,7 +24,7 @@
  * whole thing stops and says so, which is the same rule the forecast follows.
  */
 
-import { record, readMetrics } from './metrics.mjs';
+import { record, readMetrics, readBalance } from './metrics.mjs';
 import { WRITE_MULTIPLIER, READ_MULTIPLIER } from './cache.mjs';
 
 /**
@@ -54,14 +54,37 @@ export const TRIPWIRE_MIN = 10;
  * was called.
  */
 export function gapDistribution(dir, { events = readMetrics(dir) } = {}) {
-  const stamps = events.map((e) => e.at).filter(Number.isFinite).sort((a, b) => a - b);
+  // PARTITIONED BY SESSION, because the interval between the last event of one session and the
+  // first of the next is not a gap between turns at all. The log spans days, so an overnight
+  // sixteen-hour boundary was counted as one -- dominating p90 and p99 and diluting
+  // probabilityWithin in the conservative direction, so ttlTier answered "neither tier pays" on
+  // projects where it would have paid. Silent, because that bias only ever declines to act.
+  //
+  // A long gap WITHIN a session is kept. It is real evidence that caching does not pay there, and
+  // dropping it would bias the answer the other way -- making keep-warm look better than it is,
+  // which is the direction this project cares about most.
+  //
+  // Events carrying no sessionId are pooled into one group rather than discarded: most kinds do
+  // carry one, and discarding the rest would throw away whole projects' history for a technicality.
+  const bySession = new Map();
+  for (const event of events) {
+    if (!Number.isFinite(event?.at)) continue;
+    const key = event.sessionId || '';
+    if (!bySession.has(key)) bySession.set(key, []);
+    bySession.get(key).push(event.at);
+  }
+
+  const stamps = [...bySession.values()].flat();
   if (stamps.length < 8) return null;
 
   const gaps = [];
-  for (let i = 1; i < stamps.length; i++) {
-    const gap = stamps[i] - stamps[i - 1];
-    // A burst of events inside one turn is not a gap between turns.
-    if (gap > 250) gaps.push(gap);
+  for (const session of bySession.values()) {
+    session.sort((a, b) => a - b);
+    for (let i = 1; i < session.length; i++) {
+      const gap = session[i] - session[i - 1];
+      // A burst of events inside one turn is not a gap between turns.
+      if (gap > 250) gaps.push(gap);
+    }
   }
   if (gaps.length < 6) return null;
 
@@ -135,7 +158,14 @@ export function ttlTier({ prefixTokens, gaps, turnsPerSession = DEFAULT_TURNS })
   const costOf = (tier) => {
     const hit = gaps.probabilityWithin(tier.ms);
     const perTurn = hit * READ_MULTIPLIER + (1 - hit) * tier.writeMultiplier;
-    const turns = Math.max(1, turnsPerSession);
+    // THE SUPPLIED VALUE, not only the computed one. Math.max(1, NaN) is NaN -- Math.max
+    // propagates it rather than clamping -- so perTurn became NaN, the `perTurn >= 1` guard below
+    // read `NaN >= 1` as false and PASSED, and this returned action:'refresh' with an
+    // expectedValue of NaN and a reason string reading "NaN% of gaps land inside 5m". A positive
+    // verdict built entirely out of NaN. The guard was on the wrong side of the computation.
+    const turns = Number.isFinite(turnsPerSession) && turnsPerSession >= 1
+      ? turnsPerSession
+      : DEFAULT_TURNS;
     return {
       tier,
       hit,
@@ -174,9 +204,21 @@ export function recordRefresh(dir, { tier, prefixTokens, expectedValue }) {
  */
 export function recordRefreshOutcome(dir, { tier, prefixTokens, hit }) {
   const tierSpec = TIERS.find((t) => t.name === tier) || TIERS[0];
+  // THE SAME LEDGER keepWarmDecision BUYS THE REFRESH WITH. That function is explicit that a
+  // refresh is a PING, which READS the prefix -- costOfPing = prefixTokens * READ_MULTIPLIER --
+  // and its comment warns that pricing the ping as a write "overstates its cost by more than
+  // twelvefold". This scored the very same refresh as a re-WRITE, charging (writeMultiplier - 1)
+  // on both branches.
+  //
+  // The disagreement runs in the direction that kills the feature. Mean realised per refresh under
+  // the old lines was p*(0.9h - 0.25), negative below a 27.8% hit rate, while the decision's own
+  // model makes the ping pay above 8.7%. For any project whose gaps fall in that band, `tripwire`
+  // accumulates a negative balance and permanently disables a policy that is genuinely paying --
+  // and tells the user "keep-warm has lost N tokens ... stopping". The backstop fired on its own
+  // accounting error rather than on a distribution shift.
   const realised = hit
-    ? prefixTokens * (1 - READ_MULTIPLIER) - prefixTokens * (tierSpec.writeMultiplier - 1)
-    : -prefixTokens * (tierSpec.writeMultiplier - 1);
+    ? prefixTokens * (tierSpec.writeMultiplier - READ_MULTIPLIER) - prefixTokens * READ_MULTIPLIER
+    : -prefixTokens * READ_MULTIPLIER;
   record(dir, { kind: 'keepwarm', action: 'outcome', tier, prefixTokens, hit: Boolean(hit), realised: Math.round(realised) });
 }
 
@@ -188,7 +230,16 @@ export function recordRefreshOutcome(dir, { tier, prefixTokens, hit }) {
  * refreshes, keep-warm stops -- and says which tier and by how much, so the
  * stop is a finding rather than a silent behaviour change.
  */
-export function tripwire(dir, { events = readMetrics(dir) } = {}) {
+/**
+ * The backstop, read from the log that is NOT windowed.
+ *
+ * readBalance rather than readMetrics, and that distinction is the difference between a backstop
+ * that works and one that cannot. There is one outcome per refresh, in a log dominated by reads
+ * and captures, so through the 5000-event window the ten TRIPWIRE_MIN demands aged out before the
+ * tenth was written -- and this returned "only N/10 refreshes observed" for the life of the
+ * project. A guard that can never reach its own threshold is not a guard.
+ */
+export function tripwire(dir, { events = readBalance(dir) } = {}) {
   const outcomes = events.filter((e) => e.kind === 'keepwarm' && e.action === 'outcome');
   if (outcomes.length < TRIPWIRE_MIN) {
     return { tripped: false, observed: outcomes.length, reason: `only ${outcomes.length}/${TRIPWIRE_MIN} refreshes observed` };
@@ -213,14 +264,31 @@ export function tripwire(dir, { events = readMetrics(dir) } = {}) {
  * The decision as it should actually be taken: expected value, with the
  * tripwire able to veto it.
  */
-export function shouldKeepWarm(dir, { prefixTokens, events = readMetrics(dir) } = {}) {
-  const trip = tripwire(dir, { events });
+export function shouldKeepWarm(dir, {
+  prefixTokens,
+  events = readMetrics(dir),
+  // TWO SOURCES, because the two consumers want different things. gapDistribution wants the
+  // firehose -- every event is a timestamp and the recent ones describe the current rhythm. The
+  // tripwire wants the unwindowed balance log, because its outcomes are rare and are exactly what
+  // the window evicts. Passing one shared array to both, as this used to, meant whichever reader
+  // was chosen was wrong for one of them.
+  outcomes = readBalance(dir),
+} = {}) {
+  const trip = tripwire(dir, { events: outcomes });
   if (trip.tripped) return { action: 'skip', reason: trip.reason, trippedWire: true };
 
   const gaps = gapDistribution(dir, { events });
   const best = ttlTier({ prefixTokens, gaps });
   if (!best) {
+    // THE TWO MODELS ANSWER DIFFERENT QUESTIONS, so they may legitimately disagree. ttlTier asks
+    // whether holding a cache beats not caching at all; keepWarmDecision asks whether ONE ping
+    // beats letting the entry lapse -- and a ping can pay where no tier does. Coercing everything
+    // that was not 'unknown' to 'skip' while keeping the decision's reason verbatim produced a
+    // refusal justified by a GAIN: `{ action: 'skip', reason: '...expected gain 130 tokens' }`.
+    // This module's own docstring says a refusal that cannot be checked is indistinguishable from
+    // a bug; one that contradicts itself is worse.
     const decision = keepWarmDecision({ prefixTokens, gaps });
+    if (decision.action === 'refresh') return decision;
     return { action: decision.action === 'unknown' ? 'unknown' : 'skip', reason: decision.reason };
   }
   return best;

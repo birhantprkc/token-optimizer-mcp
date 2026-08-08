@@ -24,6 +24,8 @@ import { join } from 'node:path';
 import { mode, MODE_OFF, loadState, clearSeen } from './lib/policy.mjs';
 import { linkCoOccurrence } from './lib/inject.mjs';
 import { wikiDir, projectRootFor } from './lib/wiki.mjs';
+import { closeForecast } from './lib/surface.mjs';
+import { compactionNudge } from './lib/recording.mjs';
 
 /** Longest compaction may be delayed. Past this the work is abandoned. */
 const TIMEOUT_MS =
@@ -124,6 +126,45 @@ async function main() {
   // cannot shrink the map at all. The first version of this used saveState and was a
   // silent no-op until a test caught it.
   clearSeen(payload.session_id, payload.transcript_path || null);
+
+  // THE LAST HONEST MOMENT TO ASK FOR A RECORDING. Compaction is the event this whole subsystem
+  // exists for: an unrecorded conclusion does not survive it, it is destroyed rather than merely
+  // forgotten. Deliberately not gated on the once-per-session flag the router uses.
+  try {
+    const graphDir = wikiDir(projectRootFor(join(payload.cwd || process.cwd(), 'x'), payload.cwd));
+    const state = loadState(payload.session_id, payload.transcript_path || null);
+    const nudge = compactionNudge(graphDir, { edits: state.edits || 0 });
+    if (nudge) {
+      process.stdout.write(JSON.stringify({ systemMessage: nudge }));
+    }
+  } catch {
+    // Never delay compaction for a reminder.
+  }
+
+  // THE GROUND TRUTH, AT THE ONLY MOMENT IT EXISTS.
+  //
+  // Compaction firing is exactly the event every runway forecast was predicting, so this is the
+  // one place the calibration loop can be closed. Without a caller here the loop collected
+  // predictions and never scored one: reliability saw an empty set forever and calibrate returned
+  // "not yet calibrated" for the life of the project, which is indistinguishable from the feature
+  // not existing.
+  //
+  // Silent, and before the wrapper check: nothing is shown to anybody, and a plugin-only install
+  // returns early below, so putting it after would have excluded every such user from the
+  // measurement -- the same shape as the co-occurrence write above.
+  try {
+    // THE SAME RESOLVER THE PreToolUse ROUTER USES. projectRootFor starts its marker walk from
+    // `dirname(canonicalPath(filePath))`, so handing it a DIRECTORY starts the walk one level
+    // above that directory -- and closeForecast would read a different graph than maybeSurface
+    // wrote to, silently scoring nothing. The router passes a file path and resolves per file;
+    // here the equivalent is to anchor inside the cwd rather than at it.
+    closeForecast(wikiDir(projectRootFor(join(payload.cwd || process.cwd(), 'x'), payload.cwd)), {
+      transcriptPath: payload.transcript_path,
+      sessionId: payload.session_id,
+    });
+  } catch {
+    // Scoring a forecast must never delay compaction.
+  }
 
   // NOW the wrapper, which only the optimize_session spawn needs. Plugin-only
   // installs stop here having still recorded their co-occurrence above.

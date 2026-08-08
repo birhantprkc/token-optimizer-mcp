@@ -30,6 +30,8 @@
  */
 
 import { ORIGIN_HARVESTED, ORIGIN_HUMAN } from './curate.mjs';
+import { safeTrigger } from './inject.mjs';
+import { isFsSafePath } from './paths.mjs';
 
 /** Lessons longer than this are prose, not instructions. */
 const MAX_CLAIM = 400;
@@ -91,6 +93,13 @@ export function buildFeedbackDigest(turns, { maxChars = 40_000 } = {}) {
   let total = 0;
   for (let i = rendered.length - 1; i >= 0; i--) {
     const piece = rendered[i];
+    // A SINGLE oversize turn must not end the digest. One pasted stack trace in the last turn
+    // made the budget test below true on the FIRST iteration, so `out` stayed empty, this
+    // returned null, and harvest-worker skipped the entire feedback pass for that session --
+    // no extraction, no lesson validation, no metrics record, no signal anywhere. The loop runs
+    // backwards precisely to keep the end, and a big terminal turn is exactly what a session
+    // that went wrong tends to produce.
+    if (piece.length > maxChars) continue;
     if (total + piece.length > maxChars) break;
     out.unshift(piece);
     total += piece.length;
@@ -164,7 +173,7 @@ export function isImperative(claim) {
  * Returns { lessons, rejected } so a caller can report what was dropped rather
  * than silently storing less than it was given.
  */
-export function validateLessons(raw, turns) {
+export function validateLessons(raw, turns, { knownFiles = null } = {}) {
   let parsed = raw;
   if (typeof raw === 'string') {
     try {
@@ -199,9 +208,17 @@ export function validateLessons(raw, turns) {
       rejected.push({ reason: 'no-trigger', claim: claim.slice(0, 80) });
       continue;
     }
-    try {
-      new RegExp(trigger);
-    } catch {
+    // THE SAME GATE THE INJECTOR USES. `new RegExp` only proves the pattern COMPILES. inject.mjs
+    // additionally refuses sources over 200 characters and nested-quantifier ReDoS shapes -- and
+    // when it refuses, appliesToCommand falls back to a LITERAL substring search of the regex
+    // SOURCE against the command. A regex source is not a substring of any real command --
+    // a word-boundary-anchored pattern for the jest runner does not appear literally inside
+    // `npx jest --watch` --
+    // so a lesson stored with such a trigger is written to the graph, counted as delivered in the
+    // metrics record, and can never surface for the rest of its life. Both rejection shapes are
+    // realistic from the extraction prompt: a long alternation over test runners passes 200
+    // characters easily, and `(\w+\s*)+\.csproj` is the kind of thing a model emits unprompted.
+    if (!safeTrigger(trigger)) {
       rejected.push({ reason: 'bad-trigger-regex', trigger });
       continue;
     }
@@ -222,8 +239,19 @@ export function validateLessons(raw, turns) {
       // A verified human correction is as close to ground truth as this system
       // gets. An unverified paraphrase is a model's reading of one.
       confidence: verified ? 0.95 : 0.6,
+      // HELD TO THE FILES THE SESSION ACTUALLY TOUCHED, exactly as the finding path already is.
+      // harvest-worker calls validate() with `knownFiles: filesIn(digest)` and says why in its own
+      // comment -- "a model that invents a plausible path cannot anchor a finding to it" -- while
+      // this path accepted any non-empty string. The identical hallucination therefore walked
+      // straight through, and a lesson anchored to a file nobody opened is then injected on every
+      // future touch of it: a permanent instruction attached to code it was never about.
+      //
+      // isFsSafePath as well, because these strings reach the filesystem later through the graph.
+      // A path holding U+10FFFF ABORTS the process inside libuv rather than throwing, so no
+      // try/catch downstream can contain it.
       anchors: Array.isArray(item?.anchors)
-        ? item.anchors.filter((a) => typeof a === 'string' && a.trim())
+        ? item.anchors.filter((a) => typeof a === 'string' && a.trim() && isFsSafePath(a)
+            && (!knownFiles || knownFiles.includes(a)))
         : [],
     });
   }

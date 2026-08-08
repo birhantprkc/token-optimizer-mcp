@@ -335,3 +335,122 @@ describe('preview quality is reported, not buried', () => {
     expect(quality.healthy).toBe(false);
   });
 });
+
+describe('expand serves what it claims to serve', () => {
+  test('a ref that is not a digest is refused, not joined into a path', async () => {
+    // The ref arrives straight from a model-supplied tool argument -- index.ts dispatches
+    // `expand` with request.params.arguments unvalidated and the schema declares a bare string.
+    // `join` resolves `..`, so '../../notes' read notes.txt from anywhere on disk and returned it
+    // as the expansion of the pointer the caller was holding.
+    const { resolve } = await import('../../hooks-core/expand.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'exp-ref-'));
+    try {
+      // String.raw for the Windows case. Written as '..\..\notes' it collapsed to '....notes' --
+      // `\.` is not an escape sequence, so the backslashes vanished and the input duplicated the
+      // 'not-hex-at-all' case. The test still passed, so the gap was silent: the traversal shape
+      // this guard exists to refuse was never actually passed to it.
+      const windowsTraversal = String.raw`..\..\notes`;
+      expect(windowsTraversal).toContain('\\');
+
+      for (const bad of [
+        '../../../etc/passwd', windowsTraversal, 'not-hex-at-all',
+        'ABCDEF0123456789', // uppercase hex: right shape, wrong case, still refused
+        '', null, 42,
+      ]) {
+        expect(resolve(dir, bad)).toBeNull();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a well-formed but unknown digest is still null, not an adjacent file', async () => {
+    const { resolve } = await import('../../hooks-core/expand.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'exp-miss-'));
+    try {
+      expect(resolve(dir, '0123456789abcdef')).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('an expansion whose capture record is gone is marked unverified, not served as fresh', async () => {
+    // The artifact store is never pruned while metrics is a bounded tail, so artifacts routinely
+    // outlive their capture records. Staleness is then unanswerable -- and unanswerable rendered
+    // as fresh, which the module header calls worse than serving nothing.
+    const { capture, resolve } = await import('../../hooks-core/expand.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'exp-unver-'));
+    try {
+      // Capture writes the artifact AND a metrics record; delete the metrics so only the
+      // artifact survives, which is exactly the steady state being reproduced.
+      const ref = capture(dir, 'some captured output', { anchors: [], tool: 'Bash', shape: 'log' });
+      rmSync(join(dir, 'metrics.jsonl'), { force: true });
+      const out = resolve(dir, ref);
+      expect(out).toBeTruthy();
+      expect(out.text).toMatch(/UNVERIFIED/);
+      expect(out.known).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the artifact TTL is exported so the bound is not silent', async () => {
+    const { ARTIFACT_TTL_MS } = await import('../../hooks-core/expand.mjs');
+    expect(ARTIFACT_TTL_MS).toBeGreaterThan(0);
+  });
+});
+
+describe('an omission is never silent, and never invented', () => {
+  test('a large array reports the elements it withheld, with an expand ref', () => {
+    // MEASURED before the fix: a 30,281-byte array of 500 objects returned mode 'preview',
+    // `omissions: []`, ~150 bytes of text, and out.text did not contain the ref -- so 30 KB
+    // vanished, the machine-readable contract asserted nothing was omitted, and there was no
+    // pointer to recover it. Every other splitter partitions all of its input; this one did not.
+    const dir = mkdtempSync(join(tmpdir(), 'disc-arr-'));
+    try {
+      const body = JSON.stringify(Array.from({ length: 500 }, (_, i) => ({
+        id: i, name: `item-${i}`, detail: 'x'.repeat(20),
+      })));
+      const out = disclose(dir, body, { ref: 'abc123def4567890' });
+      expect(out).toBeTruthy();
+      expect(out.omissions.length).toBeGreaterThan(0);
+      expect(out.text).toContain('abc123def4567890');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('an empty array does not throw', () => {
+    // JSON.stringify(undefined) returns undefined, so `.split` threw and aborted the whole
+    // disclosure/capture block for any tool returning [].
+    expect(() => parseShape('[]')).not.toThrow();
+  });
+
+  test('the header line count agrees with the omission counts below it', () => {
+    // A JSON envelope is one physical line however large its payload, so the header read
+    // "1 lines" directly above a tail reporting thousands omitted.
+    const dir = mkdtempSync(join(tmpdir(), 'disc-hdr-'));
+    try {
+      const report = Array.from({ length: 3000 }, (_, i) => `  ok ${i} - passing test`).join('\n');
+      const out = disclose(dir, JSON.stringify({ output: report, path: 'x.ts' }), { ref: 'r9' });
+      expect(out).toBeTruthy();
+      const stated = Number(/output, ([\d,]+) lines/.exec(out.text)?.[1]?.replace(/,/g, '') ?? '0');
+      expect(stated).toBeGreaterThan(100);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a section kept in full is not labelled partial with zero lines omitted', () => {
+    // The budget check and the slice loop round differently, so the loop could consume every
+    // line of a section the check rejected -- reporting "omitted: 0 lines" and inviting the
+    // reader to spend an expand call on nothing.
+    const dir = mkdtempSync(join(tmpdir(), 'disc-zero-'));
+    try {
+      const out = disclose(dir, Array.from({ length: 1100 }, () => 'abcd').join('\n'), { ref: 'r1' });
+      if (out) for (const o of out.omissions) expect(o.lines).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
