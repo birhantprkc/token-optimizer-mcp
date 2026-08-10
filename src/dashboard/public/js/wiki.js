@@ -123,6 +123,293 @@ async function loadBalance() {
   }
 }
 
+/* ---- Causal evidence ------------------------------------------------ */
+
+function formatInterval(interval, suffix = '') {
+  if (!interval || interval.mean === null) return '—';
+  const mean = nf.format(Math.round(interval.mean * 100) / 100);
+  const low = nf.format(Math.round(interval.low * 100) / 100);
+  const high = nf.format(Math.round(interval.high * 100) / 100);
+  return `${mean}${suffix} [${low}, ${high}]`;
+}
+
+async function loadEvidence() {
+  const params = new URLSearchParams();
+  const values = {
+    client: el('evidence-client').value.trim(),
+    model: el('evidence-model').value.trim(),
+    taskId: el('evidence-task').value.trim(),
+    arm: el('evidence-arm').value,
+  };
+  for (const [key, value] of Object.entries(values))
+    if (value) params.set(key, value);
+
+  let report;
+  try {
+    report = await api(`/api/wiki/evidence?${params}`);
+  } catch {
+    el('evidence-status').textContent = 'Evidence report unavailable';
+    el('evidence-status').dataset.state = 'bad';
+    return;
+  }
+
+  const summary = report.summary;
+  const coverage =
+    summary.causalJoinCoverage === null
+      ? '—'
+      : `${Math.round(summary.causalJoinCoverage * 100)}%`;
+  el('evidence-summary').innerHTML = [
+    ['Randomized runs', nf.format(summary.evalRuns)],
+    ['Handoff runs', nf.format(summary.handoffRuns || 0)],
+    ['Concurrency runs', nf.format(summary.concurrencyRuns || 0)],
+    ['Live injections', nf.format(summary.liveInjections)],
+    ['Outcome join coverage', coverage],
+    ['Harmful feedback', nf.format(summary.harmfulFeedback)],
+  ]
+    .map(
+      ([label, value]) => `
+    <div class="stat-card"><div class="stat-content">
+      <div class="stat-label">${escapeHtml(label)}</div>
+      <div class="stat-value wiki-figure">${escapeHtml(value)}</div>
+    </div></div>`
+    )
+    .join('');
+
+  const status = el('evidence-status');
+  status.textContent = summary.evidenceStatus;
+  status.dataset.state =
+    summary.evidenceStatus === 'causal estimates available'
+      ? 'ok'
+      : 'insufficient';
+
+  const cohortRows = [];
+  for (const cohort of report.cohorts || []) {
+    for (const effect of cohort.effects || []) {
+      cohortRows.push(`<tr>
+        <td>${escapeHtml(cohort.client)}<br><span class="wiki-muted">${escapeHtml(cohort.clientVersion || 'version unknown')}</span></td>
+        <td>${escapeHtml(cohort.model || 'model unknown')}</td>
+        <td>${escapeHtml(cohort.taskId || 'task unknown')}</td>
+        <td>${escapeHtml(effect.comparison || effect.arm)}</td>
+        <td>${nf.format(effect.pairs)}</td>
+        <td>${escapeHtml(formatInterval(effect.totalTokensSaved, ' tokens'))}</td>
+        <td>${escapeHtml(formatInterval(effect.toolCallsAvoided, ' calls'))}</td>
+        <td>${escapeHtml(cohort.evidenceStatus)}</td>
+      </tr>`);
+    }
+  }
+  el('evidence-cohorts').innerHTML = `
+    <thead><tr><th>Client</th><th>Model</th><th>Task</th><th>Comparison</th><th>Pairs</th><th>Token effect (95% CI)</th><th>Call effect (95% CI)</th><th>Status</th></tr></thead>
+    <tbody>${cohortRows.join('') || '<tr><td colspan="8">No randomized cohorts match these filters.</td></tr>'}</tbody>`;
+
+  const pct = (value) =>
+    value === null || value === undefined ? '—' : `${Math.round(value * 100)}%`;
+  const transferRows = (report.transferCohorts || [])
+    .map((cohort) => {
+      const effect = cohort.effects?.naturalVsEmpty || {};
+      return `<tr>
+      <td>${escapeHtml(cohort.producerClient)}<br><span class="wiki-muted">${escapeHtml(cohort.producerModel || 'model unknown')}</span></td>
+      <td>${escapeHtml(cohort.consumerClient)}<br><span class="wiki-muted">${escapeHtml(cohort.consumerModel || 'model unknown')}</span></td>
+      <td>${escapeHtml(cohort.scenarioId || 'scenario unknown')}</td>
+      <td>${nf.format(effect.pairs || 0)}</td>
+      <td>${escapeHtml(pct(cohort.captureRate))}</td>
+      <td>${escapeHtml(pct(cohort.arms?.empty?.mistakeExecuted?.rate))} → ${escapeHtml(pct(cohort.arms?.natural?.mistakeExecuted?.rate))}</td>
+      <td>${escapeHtml(formatInterval(effect.executedMistakesPrevented))}</td>
+      <td>${escapeHtml(pct(cohort.preActionDeliveryRate))}</td>
+      <td>${escapeHtml(cohort.evidenceStatus)}</td>
+    </tr>`;
+    })
+    .join('');
+  el('evidence-transfer').innerHTML = `
+    <thead><tr><th>Producer</th><th>Consumer</th><th>Scenario</th><th>Pairs</th><th>Natural capture</th><th>Executed recurrence empty → natural</th><th>Paired prevention (95% CI)</th><th>Pre-action delivery</th><th>Gate status</th></tr></thead>
+    <tbody>${transferRows || '<tr><td colspan="9">No cross-client handoff cohorts match these filters.</td></tr>'}</tbody>`;
+
+  const concurrency = report.concurrency || {};
+  el('evidence-concurrency').innerHTML = `
+    <thead><tr><th>Natural runs</th><th>Concurrent writers</th><th>Capture</th><th>Integrity pass</th><th>Finding delivery</th><th>Consumer correctness</th><th>Executed mistakes prevented (95% CI)</th></tr></thead>
+    <tbody><tr>
+      <td>${nf.format(concurrency.naturalRuns || 0)}</td>
+      <td>${nf.format(concurrency.writers || 0)}</td>
+      <td>${escapeHtml(pct(concurrency.captureRate))}</td>
+      <td>${escapeHtml(pct(concurrency.integrityPassRate))}</td>
+      <td>${escapeHtml(pct(concurrency.deliveryCoverage))}</td>
+      <td>${escapeHtml(pct(concurrency.naturalCorrectness?.rate))}</td>
+      <td>${escapeHtml(formatInterval(concurrency.effect?.executedMistakesPrevented))}</td>
+    </tr></tbody>`;
+
+  const episodeRows = (report.episodes || [])
+    .map(
+      (trace) => `<tr>
+    <td>${escapeHtml(trace.client)}</td>
+    <td>${escapeHtml(trace.arm)}</td>
+    <td>${escapeHtml(trace.surface)}</td>
+    <td class="evidence-anchor">${escapeHtml(trace.anchor || '—')}</td>
+    <td>${nf.format(trace.deliveredTokens || 0)} / ${nf.format(trace.shadowTokens || 0)}</td>
+    <td>${trace.outcome ? `${trace.outcome.success ? '✓ success' : '✕ failed'} · ${escapeHtml(trace.outcome.joinMethod)}` : 'not joined'}</td>
+  </tr>`
+    )
+    .join('');
+  el('evidence-episodes').innerHTML = `
+    <thead><tr><th>Client</th><th>Arm</th><th>Surface</th><th>Anchor</th><th>Delivered / shadow</th><th>Outcome</th></tr></thead>
+    <tbody>${episodeRows || '<tr><td colspan="6">No live injection traces match these filters.</td></tr>'}</tbody>`;
+
+  const capabilityRows = (report.capabilities || [])
+    .map(
+      (client) => `<tr>
+    <td>${escapeHtml(client.name)}</td><td>${escapeHtml(client.tier)}</td>
+    <td>${escapeHtml(client.routing)}</td><td>${escapeHtml(client.structuralCapture)}</td>
+    <td>${escapeHtml(client.findingDelivery)}</td><td>${escapeHtml(client.semanticHarvest)}</td>
+  </tr>`
+    )
+    .join('');
+  el('evidence-capabilities').innerHTML = `
+    <thead><tr><th>Client</th><th>Tier</th><th>Routing</th><th>Capture</th><th>Delivery</th><th>Harvest</th></tr></thead>
+    <tbody>${capabilityRows}</tbody>`;
+}
+
+async function loadUcr() {
+  let status;
+  try {
+    status = await api('/api/ucr/status');
+  } catch {
+    el('ucr-summary').innerHTML = '';
+    el('ucr-verdict').textContent = 'UCR runtime unavailable';
+    el('ucr-verdict').dataset.state = 'bad';
+    return;
+  }
+  el('ucr-summary').innerHTML = [
+    ['Protocol', status.protocolVersion],
+    ['Canonical events', nf.format(status.events)],
+    ['Typed objects', nf.format(status.graph?.objects || 0)],
+    ['Certified clients', nf.format(status.certifiedClients)],
+    [
+      'Evidence artifacts',
+      status.evidenceIndex
+        ? `${status.evidenceIndex.summary.artifactsValid}/${status.evidenceIndex.summary.artifactsTotal}`
+        : 'not assembled',
+    ],
+    [
+      'Live directions',
+      status.evidenceIndex
+        ? `${status.evidenceIndex.summary.liveDirectionsPassed}/${status.evidenceIndex.summary.liveDirectionsAttempted}`
+        : 'not run',
+    ],
+    [
+      'Lower token traffic',
+      status.evidenceIndex
+        ? `${status.evidenceIndex.summary.liveDirectionsWithLowerTokenTraffic || 0}/${status.evidenceIndex.summary.liveDirectionsPassed || 0} passing`
+        : 'not measured',
+    ],
+    [
+      'Lower latency',
+      status.evidenceIndex
+        ? `${status.evidenceIndex.summary.liveDirectionsWithLowerLatency || 0}/${status.evidenceIndex.summary.liveDirectionsPassed || 0} passing`
+        : 'not measured',
+    ],
+    [
+      'Combined token reduction',
+      status.evidenceIndex?.summary.combinedLiveTokenReduction != null
+        ? `${(status.evidenceIndex.summary.combinedLiveTokenReduction * 100).toFixed(2)}%`
+        : 'not measured',
+    ],
+    [
+      'Combined latency reduction',
+      status.evidenceIndex?.summary.combinedLiveLatencyReduction != null
+        ? `${(status.evidenceIndex.summary.combinedLiveLatencyReduction * 100).toFixed(2)}%`
+        : 'not measured',
+    ],
+    [
+      'Known mistake recurrence',
+      status.evidenceIndex?.summary.runtimeKnownMistakeRecurrences != null
+        ? `${nf.format(status.evidenceIndex.summary.blindedControlMistakes || 0)} control → ${nf.format(status.evidenceIndex.summary.runtimeKnownMistakeRecurrences)} runtime`
+        : 'not measured',
+    ],
+    [
+      'Native guard denials',
+      status.evidenceIndex?.summary.nativeGuardEnforcements != null
+        ? nf.format(status.evidenceIndex.summary.nativeGuardEnforcements)
+        : 'not measured',
+    ],
+    [
+      'Capture model calls',
+      status.evidenceIndex?.summary.maximumCaptureModelCalls != null
+        ? `${nf.format(status.evidenceIndex.summary.maximumCaptureModelCalls)} additional max`
+        : 'not measured',
+    ],
+    [
+      'Consumer MCP schema',
+      status.evidenceIndex?.summary.maximumConsumerStaticSchemaTokens != null
+        ? `${nf.format(status.evidenceIndex.summary.maximumConsumerStaticSchemaTokens)} tokens max`
+        : 'not measured',
+    ],
+    ['Scale events', nf.format(status.evidenceIndex?.summary.graphEvents || 0)],
+    [
+      'Physical writers',
+      nf.format(status.evidenceIndex?.summary.coordinationWorkers || 0),
+    ],
+    [
+      'Fault exercises',
+      `${status.productionExercise?.faults?.exercised || 0}/${status.productionExercise?.faults?.required?.length || 6}`,
+    ],
+    [
+      'Cognitive schema',
+      status.evidenceIndex?.summary.cognitiveSchemaTokens
+        ? `${nf.format(status.evidenceIndex.summary.cognitiveSchemaTokens)} tokens`
+        : 'not measured',
+    ],
+    [
+      'Schema reduction',
+      status.evidenceIndex?.summary.cognitiveReductionVsFull != null
+        ? `${(status.evidenceIndex.summary.cognitiveReductionVsFull * 100).toFixed(1)}% vs full`
+        : 'not measured',
+    ],
+  ]
+    .map(
+      ([label, value]) => `
+    <div class="stat-card"><div class="stat-content">
+      <div class="stat-label">${escapeHtml(label)}</div>
+      <div class="stat-value wiki-figure">${escapeHtml(value)}</div>
+    </div></div>`
+    )
+    .join('');
+  const verdict = status.verdict?.status || 'insufficient';
+  const deterministic = status.deterministicEvidence
+    ? `${status.deterministicEvidence.checksPassed}/${status.deterministicEvidence.checksTotal} deterministic gates`
+    : 'no deterministic ledger';
+  el('ucr-verdict').textContent =
+    `${verdict} · ${deterministic} · ${status.cognitiveOperations?.length || 0} lazy cognitive operations · ${status.malformed || 0} malformed events`;
+  el('ucr-verdict').dataset.state =
+    verdict === 'passed'
+      ? 'ok'
+      : verdict === 'harmful'
+        ? 'bad'
+        : 'insufficient';
+  const tiers = status.evidenceIndex?.tiers || {};
+  el('ucr-tiers').innerHTML = `
+    <thead><tr><th>Tier</th><th>Status</th><th>Ledgers</th><th>Rows</th></tr></thead>
+    <tbody>${Object.entries(tiers)
+      .map(
+        ([tier, value]) => `<tr>
+          <td>${escapeHtml(tier)}</td>
+          <td>${escapeHtml(value.status)}</td>
+          <td>${escapeHtml(value.ledgers)}</td>
+          <td>${escapeHtml(value.rows)}</td>
+        </tr>`
+      )
+      .join('')}</tbody>`;
+  el('ucr-artifacts').innerHTML = `
+    <thead><tr><th>Study</th><th>Evidence class</th><th>Integrity</th><th>Outcome</th></tr></thead>
+    <tbody>${(status.evidenceIndex?.artifacts || [])
+      .map(
+        (artifact) => `<tr>
+          <td>${escapeHtml(artifact.name)}</td>
+          <td>${escapeHtml(artifact.evidenceClass)}</td>
+          <td>${artifact.valid ? 'valid' : 'invalid'}</td>
+          <td>${artifact.passed ? 'passed' : 'negative / incomplete'}</td>
+        </tr>`
+      )
+      .join('')}</tbody>`;
+}
+
 /* ---- Finding list ---------------------------------------------------- */
 
 function tagsFor(item) {
@@ -517,6 +804,11 @@ function showDetail(node) {
       <dt>Type</dt><dd>${escapeHtml(node.type || '—')}</dd>
       <dt>Origin</dt><dd>${node.origin === 'human' ? '✎ asserted by a person' : 'harvested from a session'}</dd>
       <dt>Confidence</dt><dd class="wiki-figure">${(node.confidence ?? 0.5).toFixed(2)}</dd>
+      <dt>Calibration</dt><dd>${escapeHtml(node.confidenceLabel || 'legacy/unlabelled')}</dd>
+      <dt>Scope</dt><dd>${escapeHtml(node.scope || 'project')}</dd>
+      <dt>Applies when</dt><dd>${escapeHtml(node.applicability || 'legacy finding: unspecified')}</dd>
+      <dt>Evidence</dt><dd>${escapeHtml(node.evidence || 'legacy finding: unspecified')}</dd>
+      <dt>Invalidated by</dt><dd>${escapeHtml((node.invalidators || []).join('; ') || 'anchor changes')}</dd>
       <dt>Status</dt><dd>${node.stale ? '⚠ stale' : 'current'}</dd>
     </dl>
     ${node.snapshot ? `<div class="wiki-diff">${escapeHtml(node.snapshot.slice(0, 2000))}</div>` : ''}
@@ -528,6 +820,8 @@ function showDetail(node) {
         <button class="btn btn-primary" id="detail-correct">Save correction</button>
         <button class="btn" id="detail-pin">${node.pinned ? 'Unpin' : 'Pin'}</button>
         <button class="btn" id="detail-retire">Retire</button>
+        <button class="btn" id="detail-helpful">Helpful</button>
+        <button class="btn" id="detail-harmful">Harmful</button>
       </div>
       <p class="wiki-muted">Corrections append: the original is retired and kept,
       so the record shows what changed and when.</p>`
@@ -561,6 +855,19 @@ function showDetail(node) {
   el('detail-retire').addEventListener('click', () =>
     curate({ action: 'retire' })
   );
+  const feedback = async (rating) => {
+    await api('/api/wiki/evidence/feedback', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-token-optimizer': 'dashboard',
+      },
+      body: JSON.stringify({ findingId: node.key, rating }),
+    });
+    await loadEvidence();
+  };
+  el('detail-helpful').addEventListener('click', () => feedback('helpful'));
+  el('detail-harmful').addEventListener('click', () => feedback('harmful'));
 }
 
 /**
@@ -677,6 +984,10 @@ el('wiki-search').addEventListener(
 );
 el('wiki-type').addEventListener('change', () => search());
 el('wiki-more-btn').addEventListener('click', () => search(true));
+for (const id of ['evidence-client', 'evidence-model', 'evidence-task']) {
+  el(id).addEventListener('input', debounce(loadEvidence, 250));
+}
+el('evidence-arm').addEventListener('change', loadEvidence);
 
 el('mode-focus').addEventListener('click', () => {
   setMode('focus');
@@ -694,8 +1005,9 @@ document.querySelectorAll('.wiki-tab').forEach((tab) => {
       t.classList.toggle('is-active', t === tab);
       t.setAttribute('aria-selected', String(t === tab));
     });
-    el('tab-explore').hidden = tab.dataset.tab !== 'explore';
-    el('tab-audit').hidden = tab.dataset.tab !== 'audit';
+    document.querySelectorAll('.wiki-panel').forEach((panel) => {
+      panel.hidden = panel.id !== `tab-${tab.dataset.tab}`;
+    });
     // The drawer describes a selection made in the tab being left, so leaving it
     // open shows detail for something no longer on screen.
     setDetailOpen(false);
@@ -750,5 +1062,11 @@ if (typeof ResizeObserver !== 'undefined') {
     el('graph-stats').textContent = 'Graph unavailable';
     return;
   }
-  await Promise.all([loadBalance(), search(), loadAudit()]);
+  await Promise.all([
+    loadBalance(),
+    search(),
+    loadAudit(),
+    loadEvidence(),
+    loadUcr(),
+  ]);
 })();

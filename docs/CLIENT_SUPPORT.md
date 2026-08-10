@@ -1,56 +1,37 @@
 # Client support
 
-Fifteen clients, in two tiers. **The tier is set by what the client's protocol
-allows, not by how much work went in** — and it is stated plainly here because
-the difference is one a user feels on their first large read.
+Sixteen clients are supported at the strongest level their current protocol
+allows. The old two-tier table was stale: it incorrectly said Gemini and Qwen
+had no pre-tool veto and omitted newer Cursor, Cline, Windsurf, and Kilo hook
+surfaces.
 
-## Enforcing tier
+## Capability matrix
 
-These clients expose a hook that runs **before** a tool executes and can refuse
-it. Expensive built-in calls are denied and redirected; optimized tooling is the
-default, not a suggestion.
+The tier is a protocol guarantee, not a product preference. A rules/MCP-only
+client cannot observe arbitrary built-in shell or file operations, so it is
+never presented as having native automatic capture.
 
-| Client | Hook surface | Install |
-|---|---|---|
-| Claude Code | `SessionStart`, `PreToolUse`, `PreCompact` | `/plugin install token-optimizer@token-optimizer` |
-| Codex | `SessionStart`, `PreToolUse` | [`integrations/codex`](../integrations/codex) |
-| OpenCode | pre-tool | [`integrations/opencode`](../integrations/opencode) |
+| Client group                                                   | Tier                   | Automatic guarantee                                                                |
+| -------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------- |
+| Claude Code, Codex, Copilot CLI, Gemini CLI, Qwen Code, Cursor | lifecycle continuation | native routing/capture/delivery and one active-model completion reflection         |
+| Cline, OpenCode, Kilo, Windsurf                                | native observation     | native routing/capture/delivery; semantic write through the active-model rule      |
+| Roo Code, Zed, Amp, Continue, Crush, Droid                     | MCP + rules            | MCP-visible activity and explicit graph tools; no claim over hidden built-in calls |
 
-## Directive tier
+The executable registry in `hooks-core/capabilities.mjs` contains the exact
+per-client surfaces and prevents the adapter, generator, verifier, dashboard,
+and certification report from inventing different matrices.
 
-These clients expose MCP but **no pre-execution veto**. The strongest available
-lever is the client's always-applied rules file, which loads on every request.
-That is meaningfully stronger than a skill — a skill is consulted only once the
-model has already decided it is relevant, which on a normal coding session is
-rarely — but it is guidance, and a model can read past guidance.
-
-| Client | Rules file | MCP config |
-|---|---|---|
-| Cursor | `.cursor/rules/token-optimizer.mdc` (`alwaysApply: true`) | `.cursor/mcp.json` |
-| Windsurf | `.windsurf/rules/token-optimizer.md` | `mcp_config.json` |
-| Cline | `.clinerules/token-optimizer.md` | `~/.cline/mcp.json` (CLI) or `cline_mcp_settings.json` (VS Code) |
-| Roo Code | `.roo/rules/token-optimizer.md` | `.roo/mcp.json` (project-level, takes precedence) |
-| Kilo | `.kilo/rules/token-optimizer.md` | `.kilo/kilo.jsonc` (`mcp` key) |
-| Zed | `AGENTS.md` | `settings.json` (`context_servers`) |
-| Amp | `AGENTS.md` | `settings.json` (`amp.mcpServers`) |
-| Continue | `.continue/rules/token-optimizer.md` | `config.yaml` |
-| Crush | `AGENTS.md` | `crush.json` |
-| Droid (Factory) | `AGENTS.md` | `~/.factory/mcp.json` |
-| GitHub Copilot CLI | `.github/copilot-instructions.md` | `mcp-config.json` |
-| Gemini CLI | extension `GEMINI.md` | `gemini-extension.json` |
-| Qwen Code | extension context file | extension config |
-
-Gemini and Qwen sit here despite having a hook API: their only tool hook is
-`AfterTool`, which fires once the read has already been paid for. Refusing at
-that point costs a turn and saves nothing on the call in question, so those
-integrations advise about the next call rather than claiming a veto they do not
-have.
+“Active-model semantic harvest” always means the model doing the work decides
+whether a durable, non-obvious conclusion exists and calls `wiki_write` itself.
+No supported path delegates that judgment to a detached harvesting model.
 
 ## One decision engine
 
-Every client above runs the same code. [`hooks-core/`](../hooks-core) holds the
-policy, the decision function, and the universal adapter; per-client entry files
-are four lines that name their client and event, and are **generated**.
+Every native command-hook client runs the decision and graph engine in
+[`hooks-core/`](../hooks-core); generated entry files only name the client and
+event. OpenCode and Kilo bridge their in-process plugin APIs into those same
+generated entries. Clients without command hooks receive rules generated from
+one source in `scripts/generate-client-configs.mjs`.
 
 This is deliberate. Before it, Claude Code, Codex and Gemini each carried their
 own copy of the threshold constant and the guidance string, and they had already
@@ -59,9 +40,11 @@ drifted. Client integrations now differ only where the protocol differs.
 ```bash
 npm run sync:hooks          # regenerate vendored copies, entries, and configs
 npm run sync:hooks:check    # CI gate: fails if any copy has drifted
+npm run verify:certification # structured protocol certification for all 16
+node scripts/certify-clients.mjs --json # also detects installed exact versions
 ```
 
-The core is vendored into each client directory rather than imported, because
+The core is vendored into each native client directory rather than imported, because
 each client executes hooks from a directory it controls (`~/.codex/hooks`, the
 Gemini extension path, the Claude Code plugin root) and no shared location
 resolves across all of them. `sync:hooks:check` is what keeps vendoring honest.
@@ -73,33 +56,39 @@ and the URL is recorded in each integration's README. That check found four real
 errors, each of which would have failed **silently** -- the file installs, the
 client reports nothing, and the server never loads:
 
-| Client | Was | Should be |
-|---|---|---|
+| Client   | Was                                | Should be                                                                                                                                                                     |
+| -------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Kilo** | `mcp_settings.json` / `mcpServers` | **wrong at the schema level.** Kilo rebranded; it reads `kilo.jsonc` under an `mcp` key, with `type: "local"`, `command` as an **array**, and `environment` rather than `env` |
-| Zed | a `source` key | not in the current schema; removed |
-| Windsurf | `.windsurfrules` | the legacy single-file form; now `.windsurf/rules/` |
-| Crush | `CRUSH.md` | the per-user file; the project one is `AGENTS.md` |
-| Cline | `cline_mcp_settings.json` | the VS Code filename; the CLI reads `~/.cline/mcp.json` |
-| Roo | `mcp_settings.json` | the global path; project-level `.roo/mcp.json` takes precedence |
+| Zed      | a `source` key                     | not in the current schema; removed                                                                                                                                            |
+| Windsurf | `.windsurfrules`                   | the legacy single-file form; now `.windsurf/rules/`                                                                                                                           |
+| Crush    | `CRUSH.md`                         | the per-user file; the project one is `AGENTS.md`                                                                                                                             |
+| Cline    | `cline_mcp_settings.json`          | the VS Code filename; the CLI reads `~/.cline/mcp.json`                                                                                                                       |
+| Roo      | `mcp_settings.json`                | the global path; project-level `.roo/mcp.json` takes precedence                                                                                                               |
 
 Kilo is the one worth dwelling on: **six of ten clients share the `mcpServers`
 convention, and assuming the seventh did too would have shipped a config that
 could never load.** Conventions are not schemas.
 
 `npm run verify:clients` asserts these shapes on every run, including that
-superseded paths stay deleted and that no directive-tier rules file claims the
-enforcement its client cannot perform.
+superseded paths stay deleted and that rule-only clients do not claim a native
+veto they do not have.
 
-All ten directive-tier shapes are now confirmed against published documentation,
+All ten generated configuration shapes are confirmed against published documentation,
 with the source URL recorded in each integration's README.
 
 ## Configuration, all clients
 
-| Variable | Default | Effect |
-|---|---|---|
-| `TOKEN_OPTIMIZER_MODE` | `enforce` | `advise` = never refuse; `off` = disable |
-| `TOKEN_OPTIMIZER_LARGE_READ_BYTES` | `25600` | Size at which a read stops being cheap |
-| `TOKEN_OPTIMIZER_PRECOMPACT_TIMEOUT_MS` | `8000` | Cap on pre-compaction work |
+The MCP server advertises its 18 essential tools by default. Set
+`TOKEN_OPTIMIZER_TOOL_PROFILE=full` in the server environment only when a client
+needs the complete 102-tool specialist catalog. Use the four-operation
+`cognitive` profile for UCR/live-graph sessions; its measured static schema is
+1,162 `cl100k_base` tokens versus 30,593 for the full catalog.
+
+| Variable                                | Default   | Effect                                   |
+| --------------------------------------- | --------- | ---------------------------------------- |
+| `TOKEN_OPTIMIZER_MODE`                  | `enforce` | `advise` = never refuse; `off` = disable |
+| `TOKEN_OPTIMIZER_LARGE_READ_BYTES`      | `25600`   | Size at which a read stops being cheap   |
+| `TOKEN_OPTIMIZER_PRECOMPACT_TIMEOUT_MS` | `8000`    | Cap on pre-compaction work               |
 
 An unrecognised `TOKEN_OPTIMIZER_MODE` falls back to `enforce`, so a typo cannot
 quietly turn the product off.

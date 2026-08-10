@@ -2,9 +2,9 @@ name: Quality Gates
 
 on:
   pull_request:
-    branches: [ master ]
+    branches: [master]
   push:
-    branches: [ master ]
+    branches: [master]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -37,7 +37,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
@@ -55,8 +55,18 @@ jobs:
       - name: Verify client integration shapes
         run: npm run verify:clients
 
+      - name: Certify all client capability tiers
+        run: npm run verify:certification
+
       - name: Verify the harvest API contract
         run: npm run verify:harvest
+
+      # UCR evidence is a checked-in, reproducible deterministic ledger. The
+      # verifier fails when runtime behavior changes without an intentional
+      # evidence refresh, and its release verdict stays insufficient until
+      # separate live-model and competitive ledgers exist.
+      - name: Verify Universal Cognitive Runtime conformance and evidence
+        run: npm run verify:ucr
 
       # BROWSER GATES. These verify the wiki dashboard actually works -- they
       # caught a real defect the moment they were first run: an open detail panel
@@ -70,6 +80,13 @@ jobs:
       # was already there.
       - name: Build, because the UI gates serve from dist/
         run: npm run build
+
+      # FULL LIVE-GRAPH GATE. This drives the model-facing wiki_write handler,
+      # the real PreToolUse hook in later/cross-project sessions, and the built
+      # dashboard HTTP API against an isolated graph. Keeping it next to the UI
+      # gates lets both reuse the build above without touching repository data.
+      - name: Verify the complete live graph flow
+        run: npm run verify:live-graph
 
       - name: Install Chromium for the UI gates
         run: npx playwright install --with-deps chromium
@@ -99,7 +116,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
@@ -200,7 +217,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
@@ -308,7 +325,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
@@ -403,7 +420,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
@@ -456,7 +473,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies

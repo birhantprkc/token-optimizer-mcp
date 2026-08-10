@@ -8,12 +8,14 @@ import {
   createToolArgumentChecker,
   type ToolDefinitionLike,
 } from './tool-arguments.js';
+import { selectToolDefinitions } from './tool-profile.js';
 import { wasteAudit, WASTE_TOOL } from './waste-tool.js';
 import { cacheAudit, CACHE_TOOL } from './cache-tool.js';
 import { modelRouting, ROUTING_TOOL } from './routing-tool.js';
 import { tokenAudit, AUDIT_TOOL } from './audit-tool.js';
 import { installDoctor, DOCTOR_TOOL } from './doctor-tool.js';
 import { fleetAudit, FLEET_TOOL } from './fleet-tool.js';
+import { McpEvidenceRecorder } from './mcp-evidence.js';
 import {
   wikiWrite,
   WIKI_WRITE_TOOL_DEFINITION,
@@ -26,6 +28,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import { runUcrTool, UCR_TOOL_DEFINITIONS } from './ucr-tools.js';
 
 import { CacheEngine } from '../core/cache-engine.js';
 import { TokenCounter } from '../core/token-counter.js';
@@ -588,6 +591,10 @@ const server = new Server(
     },
   }
 );
+const mcpEvidence = new McpEvidenceRecorder();
+server.oninitialized = () => {
+  mcpEvidence.clientInitialized(server.getClientVersion());
+};
 
 // Define tools
 /**
@@ -626,6 +633,7 @@ const TOOL_DEFINITIONS = [
   FLEET_TOOL,
   WIKI_WRITE_TOOL_DEFINITION,
   WIKI_READ_TOOL_DEFINITION,
+  ...UCR_TOOL_DEFINITIONS,
   EXPAND_TOOL,
   WASTE_TOOL,
   CACHE_TOOL,
@@ -908,18 +916,23 @@ const TOOL_DEFINITIONS = [
   CONTEXT_DELTA_TOOL_DEFINITION,
 ];
 
+const ADVERTISED_TOOL_DEFINITIONS = selectToolDefinitions(TOOL_DEFINITIONS);
+const ADVERTISED_TOOL_NAMES = new Set(
+  ADVERTISED_TOOL_DEFINITIONS.map((tool) => tool.name)
+);
+
 /**
  * Both argument checks, built from the definitions this server publishes -- so
  * neither can drift from what callers read out of `tools/list`.
  */
 const { assertRequiredFields, assertKnownFields } = createToolArgumentChecker(
-  TOOL_DEFINITIONS as ToolDefinitionLike[]
+  ADVERTISED_TOOL_DEFINITIONS as ToolDefinitionLike[]
 );
 
 // Define tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
-    tools: TOOL_DEFINITIONS,
+    tools: ADVERTISED_TOOL_DEFINITIONS,
   };
 });
 
@@ -2601,6 +2614,16 @@ async function handleToolCall(request: {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         };
       }
+      case 'context_page':
+      case 'context_receipt_verify':
+      case 'cognition_record':
+      case 'checkpoint_handoff':
+      case 'outcome_report': {
+        const result = await runUcrTool(name, args);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
       case 'smart_grep': {
         const { pattern, ...options } = args as any;
         const result = await memoizedSmartGrep(pattern, options);
@@ -2861,6 +2884,22 @@ async function handleToolCall(request: {
 }
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  if (!ADVERTISED_TOOL_NAMES.has(request.params.name)) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error:
+              `Tool ${request.params.name} is not available in the active MCP tool profile. ` +
+              'Set TOKEN_OPTIMIZER_TOOL_PROFILE=full before starting the server to expose the full catalog.',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+
   // Following a pointer is handled here rather than in the tool switch, because
   // it is not an operation on the codebase -- it is an operation on what we
   // already said about it.
@@ -2899,6 +2938,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // Best-effort: feed savings into analytics so the report/breakdown tools have
   // real data. Never blocks meaningfully or breaks the tool call.
   await recordToolAnalytics(analyticsManager, request.params.name, result);
+  mcpEvidence.toolOutcome(
+    request.params.name,
+    Date.now() - started,
+    !(result as { isError?: boolean } | null)?.isError
+  );
 
   // THE ONE PLACE EVERY TOOL RESULT PASSES THROUGH. Disclosing here rather than
   // per-tool is what keeps it a single policy instead of ninety. The elapsed
