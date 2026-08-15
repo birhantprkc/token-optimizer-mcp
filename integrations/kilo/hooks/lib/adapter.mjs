@@ -27,6 +27,7 @@ import {
   MODE_OFF,
   MODE_ADVISE,
   largeFileBytes,
+  readPayloadResult,
   withEscape,
 } from './policy.mjs';
 import {
@@ -83,6 +84,8 @@ import {
 } from './capabilities.mjs';
 import { episodeMeta, featuresForArm, usageFrom } from './experiment.mjs';
 import { evaluateUcrGuards } from './ucr-guard.mjs';
+import { beginHookInvocation, noteHookOutput } from './observability.mjs';
+import { registerProject } from './projects.mjs';
 
 /**
  * Per-client capability.
@@ -128,7 +131,14 @@ export function mutationSucceeded(clientName, raw) {
 
   // These lifecycle contracts fire this event only after a successful tool,
   // or are called by our in-process bridge only from its successful after hook.
-  return new Set(['claude-code', 'qwen', 'opencode', 'kilo', 'windsurf']).has(
+  return new Set([
+    'claude-code',
+    'codex',
+    'qwen',
+    'opencode',
+    'kilo',
+    'windsurf',
+  ]).has(
     clientName
   );
 }
@@ -178,8 +188,143 @@ function contextOutput(client, eventName, additionalContext) {
   };
 }
 
+/** Convert one static JavaScript string literal without evaluating code. */
+function codexStringLiteral(literal) {
+  if (typeof literal !== 'string' || literal.length < 2) return null;
+  const quote = literal[0];
+  if (!['"', "'", '`'].includes(quote) || literal.at(-1) !== quote) return null;
+
+  let decoded = '';
+  for (let index = 1; index < literal.length - 1; index += 1) {
+    const character = literal[index];
+    if (quote === '`' && character === '$' && literal[index + 1] === '{')
+      return null;
+    if (character !== '\\') {
+      decoded += character;
+      continue;
+    }
+
+    index += 1;
+    if (index >= literal.length - 1) return null;
+    const escaped = literal[index];
+    const simple = {
+      b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', 0: '\0',
+      '\\': '\\', "'": "'", '"': '"', '`': '`', '$': '$',
+    };
+    if (Object.hasOwn(simple, escaped)) {
+      decoded += simple[escaped];
+      continue;
+    }
+    if (escaped === '\n') continue;
+    if (escaped === '\r') {
+      if (literal[index + 1] === '\n') index += 1;
+      continue;
+    }
+    if (escaped === 'x') {
+      const digits = literal.slice(index + 1, index + 3);
+      if (!/^[0-9a-f]{2}$/i.test(digits)) return null;
+      decoded += String.fromCodePoint(Number.parseInt(digits, 16));
+      index += 2;
+      continue;
+    }
+    if (escaped === 'u') {
+      const braced = literal[index + 1] === '{';
+      const close = braced ? literal.indexOf('}', index + 2) : index + 5;
+      const digits = braced
+        ? literal.slice(index + 2, close)
+        : literal.slice(index + 1, close);
+      if (
+        close < 0 ||
+        !(braced ? /^[0-9a-f]{1,6}$/i : /^[0-9a-f]{4}$/i).test(digits)
+      ) return null;
+      const codePoint = Number.parseInt(digits, 16);
+      if (codePoint > 0x10ffff) return null;
+      decoded += String.fromCodePoint(codePoint);
+      index = close;
+      continue;
+    }
+    // JavaScript identity escapes drop the slash (for example, '\q' is 'q').
+    decoded += escaped;
+  }
+  return decoded;
+}
+
 /** Convert client-specific lifecycle envelopes into the common tool shape. */
+function codexStringBindings(source) {
+  const values = new Map();
+  const declaration = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*((?:"(?:\\.|[^"\\])*")|(?:'(?:\\.|[^'\\])*')|(?:`(?:\\.|[^`\\])*`))/gs;
+  for (const match of String(source || '').matchAll(declaration)) {
+    try {
+      const value = codexStringLiteral(match[2]);
+      if (value !== null) values.set(match[1], value);
+    } catch {
+      // A computed or malformed JavaScript expression is not safe to execute
+      // merely to understand a hook envelope. Leave it opaque.
+    }
+  }
+  return values;
+}
+
+function codexCallArguments(source, method) {
+  const calls = [];
+  const pattern = new RegExp(`(?:tools\\.)?${method}\\s*\\(\\s*([^),]+)`, 'gi');
+  for (const match of String(source || '').matchAll(pattern))
+    calls.push(match[1].trim());
+  return calls;
+}
+
+function codexLiteral(value, bindings) {
+  if (bindings.has(value)) return String(bindings.get(value));
+  return codexStringLiteral(value);
+}
+
+function codexExecCommands(source, bindings) {
+  const commands = [];
+  for (const call of String(source || '').matchAll(
+    /(?:tools\.)?exec_command\s*\(\s*\{([\s\S]*?)\}\s*\)/gi
+  )) {
+    const property = /\bcmd\s*:\s*((?:"(?:\\.|[^"\\])*")|(?:'(?:\\.|[^'\\])*')|(?:`(?:\\.|[^`\\])*`)|(?:[A-Za-z_$][\w$]*))/s.exec(call[1]);
+    if (!property) continue;
+    const command = codexLiteral(property[1], bindings);
+    if (command) commands.push(command);
+  }
+  return commands;
+}
+
 export function normalizeClientPayload(clientName, event, raw) {
+  if (clientName === 'codex') {
+    const outerName = String(raw.tool_name ?? raw.toolName ?? raw.tool ?? '');
+    if (/^(?:functions\.)?exec$/i.test(outerName)) {
+      const envelope = raw.tool_input ?? raw.toolInput ?? raw.arguments ?? raw.args;
+      const source =
+        typeof envelope === 'string'
+          ? envelope
+          : envelope?.code ?? envelope?.input ?? envelope?.source ?? '';
+      const bindings = codexStringBindings(source);
+      const patchCalls = codexCallArguments(source, 'apply_patch');
+      const patch = patchCalls
+        .map((argument) => codexLiteral(argument, bindings))
+        .find(Boolean);
+      const mutation = patchCalls.length > 0;
+      const commands = codexExecCommands(source, bindings);
+
+      // `functions.exec` is also the orchestration envelope for web, image and
+      // other non-filesystem tools. Do not reinterpret those as shell commands:
+      // doing so produced irrelevant cross-project advice and fabricated graph
+      // activity for operations the filesystem hooks never observed.
+      if (!mutation && !commands.length) return raw;
+      return {
+        ...raw,
+        tool_name: mutation ? 'apply_patch' : 'run_command',
+        tool_input: {
+          ...(envelope && typeof envelope === 'object' ? envelope : {}),
+          command: String(patch || commands.join('\n') || source || ''),
+          code_mode_envelope: true,
+        },
+      };
+    }
+  }
+
   if (clientName === 'cline') {
     const body = event === 'post-tool' ? raw.postToolUse : raw.preToolUse;
     if (!body) return raw;
@@ -241,37 +386,9 @@ export function sessionTaskContext(raw = {}) {
 }
 
 function emit(object) {
-  process.stdout.write(JSON.stringify(object));
-}
-
-/**
- * Bounded stdin read. See policy.readPayload for why the ceiling matters: the
- * entry points fail open on a THROW, but a host that opens the pipe and never
- * closes it produces no throw -- just a hook that waits forever with the user's
- * tool call stuck behind it.
- */
-async function readStdin({ timeoutMs = 5000 } = {}) {
-  const raw = await new Promise((resolve) => {
-    const chunks = [];
-    const timer = setTimeout(() => resolve(null), timeoutMs);
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk) => chunks.push(chunk));
-    process.stdin.on('end', () => {
-      clearTimeout(timer);
-      resolve(chunks.join(''));
-    });
-    process.stdin.on('error', () => {
-      clearTimeout(timer);
-      resolve(null);
-    });
-  });
-
-  if (raw === null) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+  const serialized = JSON.stringify(object);
+  noteHookOutput(object, Buffer.byteLength(serialized, 'utf8'));
+  process.stdout.write(serialized);
 }
 
 /** The session-start notice, shared verbatim so no client drifts its own copy. */
@@ -403,6 +520,22 @@ function projectBriefing() {
 function observeAndInject(payload, state, episode, features) {
   const touched = touchedFiles(payload);
   const dirFor = (path) => wikiDir(projectRootFor(path, payload.cwd));
+  const registerRoot = (root) => {
+    const dir = wikiDir(root);
+    registerProject({
+      root,
+      graphDir: dir,
+      client: episode.client || 'unknown',
+    });
+    return dir;
+  };
+
+  // SessionStart is not delivered consistently by every host/version. The
+  // graph was still written in that case, but the dashboard registry never
+  // learned it existed. Register every repository observed by a real tool call
+  // as a second, idempotent production path.
+  for (const { path } of touched)
+    registerRoot(projectRootFor(path, payload.cwd));
 
   const bytes = readCostBytes(payload);
   if (bytes && payload.tool_input.file_path) {
@@ -443,7 +576,7 @@ function observeAndInject(payload, state, episode, features) {
     const command = payload.tool_input?.command;
     if (command) {
       const root = commandProjectRoot(payload, payload.cwd);
-      const dir = wikiDir(root);
+      const dir = registerRoot(root);
       const local = forCommand(dir, load(dir), command, {
         sessionId: payload.session_id,
         alreadyInjected,
@@ -502,6 +635,17 @@ function observeAndInject(payload, state, episode, features) {
  * @param {'session-start'|'pre-tool'|'post-tool'|'stop'} event
  */
 export async function run(clientName, event) {
+  const invocation = beginHookInvocation(clientName, event);
+  try {
+    await runHook(clientName, event, invocation);
+    invocation.succeed();
+  } catch (error) {
+    // The optimizer must fail open, but the failure is now reconstructable.
+    invocation.fail(error);
+  }
+}
+
+async function runHook(clientName, event, invocation) {
   const client = CLIENTS[clientName] || CLIENTS['claude-code'];
   const eventName =
     event === 'session-start'
@@ -529,7 +673,10 @@ export async function run(clientName, event) {
     // full pre-tool timeout would turn optional context into a five-second
     // startup tax; lifecycle payloads are tiny and arrive immediately when
     // the host supplies one.
-    const raw = (await readStdin({ timeoutMs: 250 })) || {};
+    const input = await readPayloadResult({ timeoutMs: 250 });
+    const raw = input.payload || {};
+    invocation.bind(raw, null, input.bytes);
+    if (input.status !== 'ok') invocation.noteInput(input.status, input.bytes);
     const toolEvidence = optimizerToolEvidence(raw);
     const sessionId = raw.session_id ?? raw.sessionId ?? raw.conversation_id;
     if (sessionId && toolEvidence.proven) {
@@ -540,10 +687,12 @@ export async function run(clientName, event) {
     const parts = [
       policyText(client.canDeny, toolEvidence.names, toolEvidence.proven),
     ];
+    const cwd = raw.cwd || raw.working_directory || process.cwd();
+    const root = projectRootFor(join(cwd, '__session__'), cwd);
+    registerProject({ root, graphDir: wikiDir(root), client: clientName });
     if (features.retrieval) {
       try {
-        const cwd = raw.cwd || raw.working_directory || process.cwd();
-        const dir = wikiDir(projectRootFor(join(cwd, '__session__'), cwd));
+        const dir = wikiDir(root);
         // SessionStart needs hashes and claims, not stored file bodies. Parsing
         // the snapshot sidecar here would make startup scale with repository
         // history even though this compact index never renders a diff.
@@ -569,14 +718,20 @@ export async function run(clientName, event) {
     process.exit(0);
   }
 
-  const raw = await readStdin();
+  const input = await readPayloadResult();
+  const raw = input.payload;
   if (!raw) {
+    invocation.noteInput(input.status, input.bytes);
     // Stop requires JSON on stdout even when it has nothing to add.
     if (event === 'stop') emit({});
     process.exit(0);
   }
 
   if (event === 'stop') {
+    // Stop has no normalized tool payload, but it is still a fully formed hook
+    // invocation. Bind its lifecycle identifiers so successful completions do
+    // not look like an input reader that never ran in cross-client telemetry.
+    invocation.bind(raw, null, input.bytes);
     const sessionId =
       raw.session_id ?? raw.sessionId ?? raw.conversation_id ?? 'default';
     const agentScope = raw.transcript_path ?? raw.transcriptPath ?? null;
@@ -632,6 +787,7 @@ export async function run(clientName, event) {
   const payload = normalizePayload(
     normalizeClientPayload(clientName, event, raw)
   );
+  invocation.bind(raw, payload, input.bytes);
   if (!payload.tool_name) process.exit(0);
   const episode = episodeMeta({ client: clientName, raw, payload });
 
@@ -745,7 +901,14 @@ export async function run(clientName, event) {
       client.canDeny &&
       event === 'pre-tool' &&
       !repeat &&
-      mode() !== MODE_ADVISE
+      mode() !== MODE_ADVISE &&
+      // Codex code mode presents an orchestration program as one outer
+      // `functions.exec` call. Refusing that envelope is rendered by the host
+      // as a failed script and can discard several otherwise-safe nested
+      // operations. Observe it, capture it and advise, but reserve a hard veto
+      // for legacy one-operation Codex tool calls where the denied operation is
+      // unambiguous.
+      !(clientName === 'codex' && payload.tool_input?.code_mode_envelope)
   );
 
   if (canRefuse) {
@@ -754,19 +917,23 @@ export async function run(clientName, event) {
     // Every client's refusal carries the off switch, for the same reason Claude
     // Code's does: enforcement that hides its own disable is coercive.
     if (client.denyStyle === 'top-level') {
+      invocation.block('policy_denied');
       emit({ decision: 'deny', reason: withEscape(verdict.reason) });
     } else if (client.denyStyle === 'top-level-permission') {
+      invocation.block('policy_denied');
       emit({
         permissionDecision: 'deny',
         permissionDecisionReason: withEscape(verdict.reason),
       });
     } else if (client.denyStyle === 'cline') {
+      invocation.block('policy_denied');
       emit({
         cancel: true,
         contextModification: '',
         errorMessage: withEscape(verdict.reason),
       });
     } else if (client.denyStyle === 'cursor') {
+      invocation.block('policy_denied');
       emit({
         continue: true,
         permission: 'deny',
@@ -775,9 +942,11 @@ export async function run(clientName, event) {
           'Token Optimizer redirected an expensive built-in operation.',
       });
     } else if (client.denyStyle === 'exit-2') {
+      invocation.block('policy_denied');
       process.stderr.write(withEscape(verdict.reason));
       process.exit(2);
     } else {
+      invocation.block('policy_denied');
       emit({
         hookSpecificOutput: {
           hookEventName: eventName,

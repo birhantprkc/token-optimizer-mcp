@@ -1,3 +1,5 @@
+import { createKnowledgeGraph3D } from './graph3d.js';
+
 /**
  * Wiki graph browser.
  *
@@ -6,16 +8,16 @@
  * the page fail in exactly the air-gapped and locked-down environments where a
  * local-first knowledge graph is most wanted.
  *
- * TWO MODES ON ONE CANVAS, because they answer different questions:
+ * TWO LOCAL-FIRST MODES, because they answer different questions:
  *
  *   FOCUS -- one node centred with its direct edges radiating out. Readable at
  *   any graph size, because what it renders is bounded by the node's degree
  *   rather than by the size of the graph.
  *
- *   CONSTELLATION -- force-directed over a BOUNDED subgraph. The hairball that
- *   makes force layouts useless comes from running physics over everything; the
- *   server caps the subgraph, so this stays a navigation map you click into.
- *   Physics stops as soon as it settles rather than spinning forever.
+ *   EXPLORE IN 3D -- a perspective canvas over a BOUNDED subgraph. Dragging,
+ *   wheel zoom, keyboard orbit, and direct node picking make the learned graph
+ *   navigable without a CDN or a WebGL dependency. The server cap prevents the
+ *   scene from turning into an unbounded hairball.
  */
 
 const KINDS = ['file', 'symbol', 'finding', 'task'];
@@ -41,11 +43,14 @@ const el = (id) => document.getElementById(id);
 const svgNS = 'http://www.w3.org/2000/svg';
 
 const state = {
-  mode: 'focus',
+  mode: 'constellation',
   offset: 0,
   selected: null,
   items: [],
+  scope: 'all',
+  projects: [],
 };
+let knowledgeGraph3d = null;
 
 /** Kind colour, read from CSS so the validated palette has one home. */
 function colourFor(kind) {
@@ -62,6 +67,12 @@ async function api(path, options) {
   return response.json();
 }
 
+function scoped(path) {
+  const url = new URL(path, window.location.origin);
+  url.searchParams.set('scope', state.scope);
+  return `${url.pathname}${url.search}`;
+}
+
 /* ---- Balance --------------------------------------------------------- */
 
 const nf = new Intl.NumberFormat();
@@ -74,29 +85,109 @@ const nf = new Intl.NumberFormat();
  * kind of confident-looking number this project exists to argue against.
  */
 async function loadBalance() {
+  const grid = el('balance-grid');
+  const verdict = el('balance-verdict');
+  const method = el('balance-method');
   let balance;
   try {
-    balance = await api('/api/wiki/balance');
+    balance = await api(scoped('/api/wiki/balance'));
   } catch {
+    grid.innerHTML = [
+      'Graph substitutions',
+      'Modeled graph tokens avoided',
+      'Graph context returned',
+      'Graph saving classification',
+      'Memory deliveries',
+      'Kept back for comparison',
+      'Cost of remembering',
+      'Reading avoided',
+    ]
+      .map(
+        (label) => `
+        <div class="stat-card"><div class="stat-content">
+          <div class="stat-label">${escapeHtml(label)}</div>
+          <div class="stat-value wiki-figure">Unavailable</div>
+        </div></div>`
+      )
+      .join('');
+    verdict.textContent = 'Balance telemetry could not be loaded.';
+    verdict.dataset.state = 'bad';
+    method.textContent =
+      'No saving or cost claim is shown until the event source is reachable.';
     return;
   }
+
+  const measurement = balance.measurement || {};
+  const metricState = (key) => measurement.metrics?.[key] || null;
+  const measuredValue = (key, value, suffix = '') => {
+    const state = metricState(key);
+    if (state?.status === 'not-measured') return 'Not measured';
+    return `${nf.format(Number(value) || 0)}${suffix}`;
+  };
 
   // Plain language, because someone reading this page has no reason to know
   // what "injected" means. The words describe what happened, not what the code
   // calls it.
   const tiles = [
-    ['Times memory was used', nf.format(balance.injections)],
-    ['Kept back for comparison', nf.format(balance.holdouts)],
-    ['Cost of remembering', `${nf.format(balance.injectedTokens)} tokens`],
+    [
+      'Graph substitutions',
+      measuredValue(
+        'nativeSubstitutions',
+        balance.nativeOptimizer?.substitutions
+      ),
+    ],
+    [
+      'Modeled graph tokens avoided',
+      metricState('nativeSubstitutions')?.status === 'not-measured'
+        ? 'Not measured'
+        : `${nf.format(balance.nativeOptimizer?.tokensSaved || 0)} tokens`,
+    ],
+    [
+      'Graph context returned',
+      metricState('nativeSubstitutions')?.status === 'not-measured'
+        ? 'Not measured'
+        : `${nf.format(balance.nativeOptimizer?.tokensReturned || 0)} tokens`,
+    ],
+    [
+      'Graph saving classification',
+      metricState('nativeSubstitutions')?.status === 'not-measured'
+        ? 'Not measured'
+        : 'Modeled counterfactual',
+    ],
+    [
+      'Memory deliveries',
+      measuredValue(
+        'memoryDeliveries',
+        balance.memoryDeliveries ?? balance.injections
+      ),
+    ],
+    [
+      'Kept back for comparison',
+      measuredValue(
+        'memoryHoldouts',
+        balance.memoryHoldouts ?? balance.holdouts
+      ),
+    ],
+    [
+      'Cost of remembering',
+      measuredValue(
+        'rememberingCost',
+        Number(balance.deliveryTokens ?? balance.injectedTokens ?? 0) +
+          Number(balance.harvestTokens || 0),
+        ' tokens'
+      ),
+    ],
     [
       'Reading avoided',
-      balance.estimatedTokensAvoided === null
-        ? '—'
-        : `${nf.format(balance.estimatedTokensAvoided)} tokens`,
+      metricState('readingAvoided')?.status === 'not-measured'
+        ? 'Not measured'
+        : balance.estimatedTokensAvoided == null
+          ? `Collecting (${nf.format(balance.injections)} treated, ${nf.format(balance.holdouts)} held back)`
+          : `${nf.format(balance.estimatedTokensAvoided)} tokens`,
     ],
   ];
 
-  el('balance-grid').innerHTML = tiles
+  grid.innerHTML = tiles
     .map(
       ([label, value]) => `
     <div class="stat-card">
@@ -108,19 +199,74 @@ async function loadBalance() {
     )
     .join('');
 
-  const verdict = el('balance-verdict');
-  verdict.textContent = balance.verdict;
+  verdict.textContent =
+    !balance.sufficientData && Number(balance.nativeOptimizer?.tokensSaved) > 0
+      ? `${nf.format(balance.nativeOptimizer.tokensSaved)} tokens are modeled as avoided by ${nf.format(balance.nativeOptimizer.substitutions)} graph substitutions; they are not part of the verified MCP headline. The causal reuse study is still collecting.`
+      : balance.verdict;
   verdict.dataset.state = !balance.sufficientData
     ? 'insufficient'
     : balance.netTokens > 0
       ? 'positive'
       : 'negative';
 
-  if (balance.sufficientData) {
-    el('balance-method').textContent =
-      `Measured against ${nf.format(balance.holdouts)} withheld control touches — not estimated. ` +
-      `Net after injection and harvest cost: ${nf.format(balance.netTokens)} tokens.`;
-  }
+  const coverage = measurement.sourceCoverage;
+  const freshness = measurement.freshness;
+  const coverageText =
+    Number.isFinite(Number(coverage?.projects)) &&
+    Number.isFinite(Number(coverage?.projectsWithTelemetry))
+      ? `${nf.format(coverage.projectsWithTelemetry)} of ${nf.format(coverage.projects)} selected projects have telemetry`
+      : 'Telemetry coverage was not reported by this server';
+  const freshnessText =
+    freshness?.lastEventAt && freshness.status !== 'not-measured'
+      ? `latest event ${new Date(freshness.lastEventAt).toLocaleString()}`
+      : 'no telemetry event has been observed';
+
+  const facts = balance.sufficientData
+    ? [
+        [
+          'Study',
+          `${nf.format(balance.injections)} treated · ${nf.format(balance.holdouts)} holdout`,
+        ],
+        [
+          'Causal method',
+          'Control-arm comparison of downstream reads; not estimated from file size',
+        ],
+        [
+          'Net graph effect',
+          `${nf.format(balance.netTokens)} tokens after delivery and harvest cost`,
+        ],
+        ['Coverage', coverageText],
+        ['Freshness', freshnessText],
+      ]
+    : [
+        [
+          'Modeled substitution',
+          `${nf.format(balance.nativeOptimizer?.tokensSaved || 0)} tokens reported across ${nf.format(balance.nativeOptimizer?.substitutions || 0)} served results; excluded from verified MCP savings`,
+        ],
+        [
+          'Causal method',
+          'Control-arm comparison of downstream reads; no effect is estimated before the evidence gate',
+        ],
+        [
+          'File study',
+          `${nf.format(balance.injections)}/20 treated · ${nf.format(balance.holdouts)}/5 holdout`,
+        ],
+        [
+          'Excluded surfaces',
+          'Command and session-start deliveries have no valid downstream file-read join',
+        ],
+        ['Coverage', coverageText],
+        ['Freshness', freshnessText],
+      ];
+  method.innerHTML = facts
+    .map(
+      ([label, value]) => `
+      <div class="method-fact">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(value)}</strong>
+      </div>`
+    )
+    .join('');
 }
 
 /* ---- Causal evidence ------------------------------------------------ */
@@ -135,6 +281,7 @@ function formatInterval(interval, suffix = '') {
 
 async function loadEvidence() {
   const params = new URLSearchParams();
+  params.set('scope', state.scope);
   const values = {
     client: el('evidence-client').value.trim(),
     model: el('evidence-model').value.trim(),
@@ -154,14 +301,16 @@ async function loadEvidence() {
   }
 
   const summary = report.summary;
+  const measuredCount = (value) =>
+    Number(value) > 0 ? nf.format(value) : 'Not run';
   const coverage =
     summary.causalJoinCoverage === null
-      ? '—'
+      ? 'Not measurable'
       : `${Math.round(summary.causalJoinCoverage * 100)}%`;
   el('evidence-summary').innerHTML = [
-    ['Randomized runs', nf.format(summary.evalRuns)],
-    ['Handoff runs', nf.format(summary.handoffRuns || 0)],
-    ['Concurrency runs', nf.format(summary.concurrencyRuns || 0)],
+    ['Randomized runs', measuredCount(summary.evalRuns)],
+    ['Handoff runs', measuredCount(summary.handoffRuns)],
+    ['Concurrency runs', measuredCount(summary.concurrencyRuns)],
     ['Live injections', nf.format(summary.liveInjections)],
     ['Outcome join coverage', coverage],
     ['Harmful feedback', nf.format(summary.harmfulFeedback)],
@@ -176,7 +325,10 @@ async function loadEvidence() {
     .join('');
 
   const status = el('evidence-status');
-  status.textContent = summary.evidenceStatus;
+  const sourceCoverage = report.sourceCoverage;
+  status.textContent = sourceCoverage
+    ? `${summary.evidenceStatus} · ${nf.format(sourceCoverage.projectsWithEvidence)} of ${nf.format(sourceCoverage.projects)} selected projects have evidence events`
+    : summary.evidenceStatus;
   status.dataset.state =
     summary.evidenceStatus === 'causal estimates available'
       ? 'ok'
@@ -278,9 +430,73 @@ async function loadUcr() {
   }
   el('ucr-summary').innerHTML = [
     ['Protocol', status.protocolVersion],
-    ['Canonical events', nf.format(status.events)],
-    ['Typed objects', nf.format(status.graph?.objects || 0)],
+    [
+      'UCR runtime events',
+      status.events ? nf.format(status.events) : 'Not exercised',
+    ],
+    [
+      'UCR typed objects',
+      status.graph?.objects ? nf.format(status.graph.objects) : 'Not exercised',
+    ],
     ['Certified clients', nf.format(status.certifiedClients)],
+    [
+      'Effectiveness verdict',
+      status.tieredVerdict?.effectiveness?.status || 'insufficient',
+    ],
+    [
+      'Superiority verdict',
+      status.tieredVerdict?.superiority?.status || 'insufficient',
+    ],
+    [
+      'Production verdict',
+      status.tieredVerdict?.production?.status || 'insufficient',
+    ],
+    [
+      'Missing effectiveness metrics',
+      nf.format(status.tieredVerdict?.effectiveness?.missing?.length || 0),
+    ],
+    [
+      'Frozen study design',
+      status.evidenceIndex?.summary.studyDesign?.passed
+        ? `${nf.format(status.evidenceIndex.summary.studyDesign.trials)} trials / ${nf.format(status.evidenceIndex.summary.studyDesign.providerInvocations)} calls`
+        : 'not ready',
+    ],
+    [
+      'Release metrics mapped',
+      status.evidenceIndex?.summary.studyDesign?.mappedMetrics != null
+        ? nf.format(status.evidenceIndex.summary.studyDesign.mappedMetrics)
+        : 'not measured',
+    ],
+    [
+      'Universal CLI drivers',
+      status.evidenceIndex?.summary.studyDesign?.universalDriverClients != null
+        ? `${nf.format(status.evidenceIndex.summary.studyDesign.universalDriverClients)} protocol-mapped / ${nf.format(status.evidenceIndex.summary.studyDesign.representativeStudyClients || 0)} in powered live matrix`
+        : 'not measured',
+    ],
+    [
+      'Benchmark family coverage',
+      status.metrics?.benchmarkFamilyCoverage != null
+        ? `${(status.metrics.benchmarkFamilyCoverage * 100).toFixed(1)}%`
+        : 'not measured',
+    ],
+    [
+      'Benchmark arm coverage',
+      status.metrics?.benchmarkArmCoverage != null
+        ? `${(status.metrics.benchmarkArmCoverage * 100).toFixed(1)}%`
+        : 'not measured',
+    ],
+    [
+      'Worst negative-delivery 95% upper',
+      status.metrics?.negativeDeliveryIntervalHigh != null
+        ? `${(status.metrics.negativeDeliveryIntervalHigh * 100).toFixed(2)}%`
+        : 'not measured',
+    ],
+    [
+      'Worst directional token upper',
+      status.metrics?.directionalTokenOverheadHigh != null
+        ? `${(status.metrics.directionalTokenOverheadHigh * 100).toFixed(2)}%`
+        : 'not measured',
+    ],
     [
       'Evidence artifacts',
       status.evidenceIndex
@@ -371,7 +587,7 @@ async function loadUcr() {
     </div></div>`
     )
     .join('');
-  const verdict = status.verdict?.status || 'insufficient';
+  const verdict = status.tieredVerdict?.status || 'insufficient';
   const deterministic = status.deterministicEvidence
     ? `${status.deterministicEvidence.checksPassed}/${status.deterministicEvidence.checksTotal} deterministic gates`
     : 'no deterministic ledger';
@@ -383,6 +599,30 @@ async function loadUcr() {
       : verdict === 'harmful'
         ? 'bad'
         : 'insufficient';
+  const missingMetrics = status.metricCoverage?.missing || [];
+  const producerFor = (evidenceClass) =>
+    ({
+      effectiveness: 'Powered full study',
+      superiority: 'Competitive study',
+      production: 'Signed production traffic study',
+      conformance: 'Adapter certification',
+      transport: 'Transport integrity study',
+    })[evidenceClass] || 'Unclassified producer';
+  el('ucr-missing').innerHTML = `
+    <thead><tr><th>Metric</th><th>Required evidence</th><th>Producer</th><th>Eligible ledgers</th></tr></thead>
+    <tbody>${
+      missingMetrics
+        .map(
+          (metric) => `<tr>
+          <td>${escapeHtml(metric.metric)}</td>
+          <td>${escapeHtml(metric.requiredEvidence)}</td>
+          <td>${escapeHtml(producerFor(metric.requiredEvidence))}</td>
+          <td>${nf.format(metric.eligibleLedgers || 0)}</td>
+        </tr>`
+        )
+        .join('') ||
+      '<tr><td colspan="4">Every release metric has an eligible evidence source.</td></tr>'
+    }</tbody>`;
   const tiers = status.evidenceIndex?.tiers || {};
   el('ucr-tiers').innerHTML = `
     <thead><tr><th>Tier</th><th>Status</th><th>Ledgers</th><th>Rows</th></tr></thead>
@@ -404,7 +644,15 @@ async function loadUcr() {
           <td>${escapeHtml(artifact.name)}</td>
           <td>${escapeHtml(artifact.evidenceClass)}</td>
           <td>${artifact.valid ? 'valid' : 'invalid'}</td>
-          <td>${artifact.passed ? 'passed' : 'negative / incomplete'}</td>
+          <td>${
+            artifact.passed
+              ? 'passed'
+              : artifact.qualificationPassed
+                ? `qualification passed (non-promotable${artifact.qualificationMaximumTokenOverhead == null ? '' : `; max token overhead ${(artifact.qualificationMaximumTokenOverhead * 100).toFixed(2)}%`})`
+                : artifact.qualificationStatus === 'failed'
+                  ? 'qualification failed'
+                  : 'negative / incomplete'
+          }</td>
         </tr>`
       )
       .join('')}</tbody>`;
@@ -414,6 +662,8 @@ async function loadUcr() {
 
 function tagsFor(item) {
   const tags = [];
+  if (state.scope === 'all' && item.projectName)
+    tags.push({ text: item.projectName, status: 'project' });
   if (item.type && item.type !== 'finding') tags.push({ text: item.type });
   if (item.origin === 'human') tags.push({ text: '✎ human', status: 'human' });
   if (item.pinned) tags.push({ text: '★ pinned', status: 'pinned' });
@@ -480,7 +730,7 @@ async function search(append = false) {
     offset: String(state.offset),
     limit: '50',
   });
-  const result = await api(`/api/wiki/search?${params}`);
+  const result = await api(scoped(`/api/wiki/search?${params}`));
 
   state.items = append ? state.items.concat(result.items) : result.items;
   state.offset += result.items.length;
@@ -568,6 +818,8 @@ function drawEdge(svg, x1, y1, x2, y2, kind) {
 async function renderFocus(nodeId) {
   const data = await api(`/api/wiki/node/${encodeURIComponent(nodeId)}`);
   const svg = el('wiki-graph');
+  el('wiki-graph-3d').hidden = true;
+  svg.removeAttribute('hidden');
   clearGraph();
   el('graph-hint').hidden = true;
 
@@ -605,96 +857,29 @@ async function renderFocus(nodeId) {
  * after it settles.
  */
 async function renderConstellation() {
-  const data = await api('/api/wiki/constellation?cap=150');
+  const data = await api(scoped('/api/wiki/constellation?cap=150'));
   const svg = el('wiki-graph');
+  const host = el('wiki-graph-3d');
+  svg.setAttribute('hidden', '');
+  host.hidden = false;
   clearGraph();
-  el('graph-hint').hidden = data.nodes.length > 0;
+  const hint = el('graph-hint');
+  hint.hidden = false;
+  hint.textContent = data.nodes.length
+    ? data.capped
+      ? `Showing the ${nf.format(data.renderedFindings)} highest-confidence findings from ${nf.format(data.projects)} sources; ${nf.format(data.findings)} findings are captured in this scope. Drag to orbit, scroll to zoom, and select a node to inspect it.`
+      : `Showing all ${nf.format(data.findings)} findings from ${nf.format(data.projects)} sources. Drag to orbit, scroll to zoom, and select a node to inspect it.`
+    : 'The 3D knowledge map will appear as supported coding agents capture project findings.';
 
-  const { width, height } = paneSize();
-
-  const positions = new Map();
-  data.nodes.forEach((node, index) => {
-    // Seeded from the index rather than randomly, so a refresh does not
-    // reshuffle a layout the user has just learned to read.
-    const angle = index * 2.39996;
-    const radius =
-      20 +
-      (index / data.nodes.length) *
-        Math.min(width - LABEL_GUTTER * 2, height) *
-        0.42;
-    positions.set(node.id, {
-      x: width / 2 + Math.cos(angle) * radius,
-      y: height / 2 + Math.sin(angle) * radius,
+  if (knowledgeGraph3d) {
+    knowledgeGraph3d.update(data);
+    knowledgeGraph3d.select(state.selected);
+  } else {
+    knowledgeGraph3d = createKnowledgeGraph3D(host, data, {
+      selected: state.selected,
+      onSelect: (node) => selectNode(node.id),
     });
-  });
-
-  const REPULSION = 2600;
-  const SPRING = 0.012;
-  const IDEAL = 70;
-
-  for (let tick = 0; tick < 160; tick++) {
-    const cooling = 1 - tick / 160;
-
-    for (const [idA, a] of positions) {
-      for (const [idB, b] of positions) {
-        if (idA === idB) continue;
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const distance = Math.hypot(dx, dy) || 0.01;
-        const force = (REPULSION / (distance * distance)) * cooling;
-        a.x += (dx / distance) * force;
-        a.y += (dy / distance) * force;
-      }
-    }
-
-    for (const edge of data.edges) {
-      const a = positions.get(edge.from);
-      const b = positions.get(edge.to);
-      if (!a || !b) continue;
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const distance = Math.hypot(dx, dy) || 0.01;
-      const pull = (distance - IDEAL) * SPRING * cooling;
-      a.x += (dx / distance) * pull;
-      a.y += (dy / distance) * pull;
-      b.x -= (dx / distance) * pull;
-      b.y -= (dy / distance) * pull;
-    }
-
-    for (const point of positions.values()) {
-      // Clamped inside the label gutter, not the raw canvas, so a node at the
-      // boundary still has room for its caption.
-      point.x = Math.max(LABEL_GUTTER, Math.min(width - LABEL_GUTTER, point.x));
-      point.y = Math.max(24, Math.min(height - 24, point.y));
-    }
   }
-
-  // Labels sit on a single baseline per node, so two nodes at a similar height
-  // overlap even when the MARKS are comfortably apart. The physics has no
-  // notion of text, so a separate pass nudges colliding captions apart. Without
-  // it, dense regions produce overlapping unreadable text -- visible only by
-  // looking at the rendered page, never from the node coordinates alone.
-  const LABEL_HEIGHT = 14;
-  const ordered = [...positions.entries()].sort((a, b) => a[1].y - b[1].y);
-  for (let i = 1; i < ordered.length; i++) {
-    const [, previous] = ordered[i - 1];
-    const [, current] = ordered[i];
-    const sameSide = previous.x > width * 0.55 === current.x > width * 0.55;
-    if (sameSide && current.y - previous.y < LABEL_HEIGHT) {
-      current.y = Math.min(height - 24, previous.y + LABEL_HEIGHT);
-    }
-  }
-
-  for (const edge of data.edges) {
-    const a = positions.get(edge.from);
-    const b = positions.get(edge.to);
-    if (a && b) drawEdge(svg, a.x, a.y, b.x, b.y, null);
-  }
-  for (const node of data.nodes) {
-    const point = positions.get(node.id);
-    if (point) drawNode(svg, node, point.x, point.y, false);
-  }
-  fitLabels(svg);
 }
 
 /**
@@ -801,6 +986,7 @@ function showDetail(node) {
     <h3>${escapeHtml(node.claim || node.key)}</h3>
     <dl>
       <dt>Kind</dt><dd>${escapeHtml(node.kind)}</dd>
+      <dt>Project</dt><dd>${escapeHtml(node.projectName || 'Current project')}</dd>
       <dt>Type</dt><dd>${escapeHtml(node.type || '—')}</dd>
       <dt>Origin</dt><dd>${node.origin === 'human' ? '✎ asserted by a person' : 'harvested from a session'}</dd>
       <dt>Confidence</dt><dd class="wiki-figure">${(node.confidence ?? 0.5).toFixed(2)}</dd>
@@ -839,7 +1025,11 @@ function showDetail(node) {
         'content-type': 'application/json',
         'x-token-optimizer': 'dashboard',
       },
-      body: JSON.stringify({ key: node.key, ...body }),
+      body: JSON.stringify({
+        key: node.key,
+        projectId: node.projectId,
+        ...body,
+      }),
     });
     setDetailOpen(false);
     await Promise.all([search(), loadAudit()]);
@@ -862,7 +1052,11 @@ function showDetail(node) {
         'content-type': 'application/json',
         'x-token-optimizer': 'dashboard',
       },
-      body: JSON.stringify({ findingId: node.key, rating }),
+      body: JSON.stringify({
+        findingId: node.key,
+        projectId: node.projectId,
+        rating,
+      }),
     });
     await loadEvidence();
   };
@@ -886,18 +1080,24 @@ function setMode(mode) {
   el('mode-constellation').classList.toggle('is-active', !focus);
   el('mode-focus').setAttribute('aria-pressed', String(focus));
   el('mode-constellation').setAttribute('aria-pressed', String(!focus));
+  el('wiki-graph').toggleAttribute('hidden', !focus);
+  el('wiki-graph-3d').hidden = focus;
 }
 
 async function selectNode(nodeId) {
-  // Selecting a node IS a focus action, whatever mode was active before.
-  setMode('focus');
   state.selected = nodeId;
   document
     .querySelectorAll('.wiki-list li')
     .forEach((li) =>
       li.setAttribute('aria-current', String(li.dataset.id === nodeId))
     );
-  await renderFocus(nodeId);
+  if (state.mode === 'focus') {
+    await renderFocus(nodeId);
+    return;
+  }
+  knowledgeGraph3d?.select(nodeId);
+  const data = await api(`/api/wiki/node/${encodeURIComponent(nodeId)}`);
+  showDetail(data.node);
 }
 
 /* ---- Audit ----------------------------------------------------------- */
@@ -928,7 +1128,7 @@ const AUDIT_GROUPS = [
 async function loadAudit() {
   let audit;
   try {
-    audit = await api('/api/wiki/audit');
+    audit = await api(scoped('/api/wiki/audit'));
   } catch {
     return;
   }
@@ -959,6 +1159,187 @@ async function loadAudit() {
     '<p class="wiki-muted">Nothing needs attention. The graph is healthy.</p>';
 }
 
+async function loadHookHealth() {
+  const grid = el('hook-health-grid');
+  const status = el('hook-health-status');
+  const detail = el('hook-health-detail');
+  const clientsHost = el('hook-health-clients');
+  try {
+    const [report, mcpReport] = await Promise.all([
+      api('/api/diagnostics/hooks?hours=24&limit=20'),
+      api('/api/diagnostics/mcp?hours=24&limit=20'),
+    ]);
+    const summary = report.summary;
+    const mcp = mcpReport.summary;
+    const success =
+      summary.successRate === null
+        ? '—'
+        : `${(summary.successRate * 100).toFixed(1)}%`;
+    grid.innerHTML = [
+      ['Hook runs', nf.format(summary.total)],
+      ['Success rate', success],
+      ['Failures', nf.format(summary.failures)],
+      ['Timeouts', nf.format(summary.timeouts)],
+      ['Policy blocks', nf.format(summary.blocked || 0)],
+      ['Abandoned', nf.format(summary.abandoned || 0)],
+      [
+        'p50 latency',
+        summary.p50DurationMs == null ? '—' : `${summary.p50DurationMs} ms`,
+      ],
+      [
+        'p95 latency',
+        summary.p95DurationMs == null ? '—' : `${summary.p95DurationMs} ms`,
+      ],
+      ['MCP processes', nf.format(mcp.processes)],
+      ['MCP handshakes', nf.format(mcp.initializedClients)],
+      [
+        'Tools advertised',
+        mcp.advertisedTools == null ? '—' : nf.format(mcp.advertisedTools),
+      ],
+      ['MCP tool calls', nf.format(mcp.toolCalls)],
+      ['MCP failures', nf.format(mcp.failures)],
+      [
+        'MCP p95 latency',
+        mcp.p95DurationMs == null ? '—' : `${mcp.p95DurationMs} ms`,
+      ],
+    ]
+      .map(
+        ([label, value]) => `
+        <div class="stat-card"><div class="stat-content">
+          <div class="stat-label">${escapeHtml(label)}</div>
+          <div class="stat-value wiki-figure">${escapeHtml(value)}</div>
+        </div></div>`
+      )
+      .join('');
+
+    const unhealthy =
+      summary.failures > 0 ||
+      summary.timeouts > 0 ||
+      summary.abandoned > 0 ||
+      mcp.failures > 0;
+    status.textContent =
+      !summary.available && !mcp.available
+        ? 'No hook or MCP lifecycle telemetry has been captured yet.'
+        : unhealthy
+          ? `${summary.failures} hook failure(s), ${summary.timeouts} timeout(s), and ${mcp.failures} MCP failure(s) need attention.`
+          : `${summary.blocked || 0} intentional policy block(s); hook and MCP runtime show no failures.`;
+    status.dataset.state =
+      !summary.available && !mcp.available
+        ? 'insufficient'
+        : unhealthy
+          ? 'bad'
+          : 'ok';
+    const clients = new Map();
+    for (const [name, value] of Object.entries(summary.byClient || {})) {
+      clients.set(name, {
+        name,
+        kinds: ['Lifecycle hooks'],
+        activity: [`${nf.format(value.total)} hook runs`],
+        reliability: [
+          `${nf.format(value.failures)} hook failures · ${nf.format(value.timeouts)} timeouts`,
+        ],
+        policy: [
+          `${nf.format(value.blocked || 0)} blocked · ${nf.format(value.skipped || 0)} skipped`,
+        ],
+        coverage: [
+          `hooks: ${(value.hookEvents || []).join(', ') || 'surface unknown'}`,
+        ],
+        unhealthy: value.failures > 0 || value.timeouts > 0,
+      });
+    }
+    for (const [name, value] of Object.entries(mcp.clients || {})) {
+      const client = clients.get(name) || {
+        name,
+        kinds: [],
+        activity: [],
+        reliability: [],
+        policy: [],
+        coverage: [],
+        unhealthy: false,
+      };
+      client.kinds.push('MCP');
+      client.activity.push(`${nf.format(value.calls)} MCP calls`);
+      client.reliability.push(`${nf.format(value.failures)} MCP failures`);
+      client.policy.push(`${nf.format(value.initialized)} handshakes`);
+      client.coverage.push('MCP: stdio tool protocol');
+      client.unhealthy ||= value.failures > 0;
+      clients.set(name, client);
+    }
+    clientsHost.innerHTML = [...clients.values()]
+      .map(
+        (client) => `
+        <article class="capture-client${client.unhealthy ? ' is-unhealthy' : ''}">
+          <div class="capture-client-name">
+            <strong>${escapeHtml(client.name)}</strong>
+            <span>${escapeHtml(client.kinds.join(' + '))}</span>
+          </div>
+          <dl>
+            <div><dt>Activity</dt><dd>${escapeHtml(client.activity.join(' · '))}</dd></div>
+            <div><dt>Runtime</dt><dd>${escapeHtml(client.reliability.join(' · '))}</dd></div>
+            <div><dt>Control</dt><dd>${escapeHtml(client.policy.join(' · '))}</dd></div>
+            <div><dt>Coverage</dt><dd>${escapeHtml(client.coverage.join(' · '))}</dd></div>
+          </dl>
+        </article>`
+      )
+      .join('');
+    detail.textContent =
+      'Diagnostics are privacy-safe: no prompts, commands, file paths, or tool output are retained.';
+  } catch {
+    grid.innerHTML = '';
+    status.textContent = 'Capture diagnostics unavailable.';
+    status.dataset.state = 'bad';
+    clientsHost.innerHTML = '';
+    detail.textContent = '';
+  }
+}
+
+async function loadProjects() {
+  const inventory = await api('/api/wiki/projects');
+  state.projects = inventory.projects || [];
+  const select = el('wiki-scope');
+  select.innerHTML = [
+    `<option value="all">All known projects (${nf.format(inventory.captured)} captured)</option>`,
+    ...state.projects.map(
+      (project) =>
+        `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}${project.current ? ' — current' : ''}${project.captured ? '' : ' — no capture yet'}</option>`
+    ),
+  ].join('');
+  select.value = state.scope;
+  const missing = state.projects.filter((project) => !project.captured);
+  el('wiki-coverage').textContent = missing.length
+    ? `${nf.format(inventory.captured)} of ${nf.format(state.projects.length)} known sources contain graph data. Missing capture: ${missing.map((project) => project.name).join(', ')}.`
+    : `${nf.format(inventory.captured)} known sources contain graph data; no registered source is missing its graph.`;
+}
+
+async function loadGraphStatus() {
+  const status = await api(scoped('/api/wiki/status'));
+  const scopeLabel =
+    state.scope === 'all'
+      ? `${nf.format(status.capturedProjects)} captured sources`
+      : state.projects.find((project) => project.id === state.scope)?.name ||
+        'current project';
+  el('graph-stats').textContent = status.available
+    ? `${nf.format(status.findings)} findings · ${nf.format(status.nodes)} nodes · ${nf.format(status.edges)} edges · ${scopeLabel}`
+    : 'No graph yet — it builds as you work';
+  return status;
+}
+
+async function changeScope() {
+  state.scope = el('wiki-scope').value;
+  state.selected = null;
+  setDetailOpen(false);
+  el('wiki-export').href =
+    `/api/wiki/export?scope=${encodeURIComponent(state.scope)}`;
+  const status = await loadGraphStatus();
+  if (!status.available) return;
+  await Promise.all([
+    loadBalance(),
+    search(),
+    renderConstellation(),
+    loadAudit(),
+  ]);
+}
+
 /* ---- Wiring ---------------------------------------------------------- */
 
 function debounce(fn, ms) {
@@ -983,6 +1364,7 @@ el('wiki-search').addEventListener(
   debounce(() => search(), 250)
 );
 el('wiki-type').addEventListener('change', () => search());
+el('wiki-scope').addEventListener('change', changeScope);
 el('wiki-more-btn').addEventListener('click', () => search(true));
 for (const id of ['evidence-client', 'evidence-model', 'evidence-task']) {
   el(id).addEventListener('input', debounce(loadEvidence, 250));
@@ -1048,15 +1430,14 @@ if (typeof ResizeObserver !== 'undefined') {
       lastWidth = width;
       reRender();
     }
-  }).observe(el('wiki-graph'));
+  }).observe(el('wiki-graph-stage'));
 }
 
 (async function init() {
+  await loadHookHealth();
   try {
-    const status = await api('/api/wiki/status');
-    el('graph-stats').textContent = status.available
-      ? `${status.findings} findings · ${status.nodes} nodes · ${status.edges} edges`
-      : 'No graph yet — it builds as you work';
+    await loadProjects();
+    const status = await loadGraphStatus();
     if (!status.available) return;
   } catch {
     el('graph-stats').textContent = 'Graph unavailable';
@@ -1065,6 +1446,7 @@ if (typeof ResizeObserver !== 'undefined') {
   await Promise.all([
     loadBalance(),
     search(),
+    renderConstellation(),
     loadAudit(),
     loadEvidence(),
     loadUcr(),

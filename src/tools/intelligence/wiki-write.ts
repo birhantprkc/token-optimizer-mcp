@@ -186,10 +186,12 @@ export async function wikiWrite(
     : [];
 
   try {
-    const [wiki, harvestWrite, curate] = await Promise.all([
+    const [wiki, harvestWrite, curate, metrics, projects] = await Promise.all([
       import(coreUrl('wiki.mjs')),
       import(coreUrl('harvest-write.mjs')),
       import(coreUrl('curate.mjs')),
+      import(coreUrl('metrics.mjs')),
+      import(coreUrl('projects.mjs')),
     ]);
 
     // The finding belongs to the project the ANCHOR is in, not to wherever the
@@ -199,6 +201,7 @@ export async function wikiWrite(
       options.projectRoot ??
       wiki.projectRootFor(anchors[0].split('#')[0], process.cwd());
     const dir = wiki.wikiDir(project);
+    projects.registerProject({ root: project, graphDir: dir, client: 'mcp' });
 
     const keys: string[] = harvestWrite.writeHarvested(
       dir,
@@ -240,6 +243,34 @@ export async function wikiWrite(
       return !graph.nodes.has(id);
     });
 
+    if (keys.length) {
+      // This is the marginal context used to persist the conclusion: the model
+      // emits these tool arguments specifically so later models need not derive
+      // them again. It was previously written by fixture seeders only, making
+      // "cost of remembering" permanently under-report real use.
+      const payloadTokens = Math.ceil(
+        Buffer.byteLength(
+          JSON.stringify({
+            claim,
+            anchors,
+            evidence,
+            applicability,
+            type,
+            trigger: options.trigger,
+            invalidators,
+          }),
+          'utf8'
+        ) / 4
+      );
+      metrics.record(dir, {
+        kind: 'harvest',
+        tokens: payloadTokens,
+        findings: keys.length,
+        origin: curate.ORIGIN_AGENT,
+        sessionId: options.sessionId ?? null,
+      });
+    }
+
     return {
       success: keys.length > 0,
       written: keys.length,
@@ -270,6 +301,13 @@ export const WIKI_WRITE_TOOL_DEFINITION = {
     'lets the claim be invalidated when that code changes, and what makes it surface ' +
     'automatically when the file is next touched. Costs nothing and sends nothing off ' +
     'the machine.',
+  annotations: {
+    title: 'Record project knowledge',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
   inputSchema: {
     type: 'object',
     properties: {

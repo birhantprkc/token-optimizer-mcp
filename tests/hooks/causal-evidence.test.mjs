@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   evidenceReport,
+  evidenceReportMany,
   readEvidence,
   record,
   recordFindingFeedback,
@@ -72,6 +73,40 @@ describe('causal episode tracing', () => {
     });
   });
 
+  test('an exact repeat enriches the existing finding with newly resolvable anchors', () => {
+    const key = seed();
+    const second = join(workspace, 'package.json');
+    writeFileSync(second, '{"scripts":{"test":"jest"}}\n');
+
+    const repeated = writeHarvested(dir, [{
+      type: 'command',
+      claim: 'Use npm test instead of the unsupported direct probe.',
+      evidence: 'The package command passed and the direct probe exited one.',
+      applicability: 'When verification uses the unsupported direct probe.',
+      confidenceLabel: 'verified',
+      confidence: 0.98,
+      scope: 'project',
+      invalidators: ['package.json test script changes'],
+      trigger: 'bad-command',
+      anchors: [anchor, second],
+    }], { sessionId: 'second-session', origin: ORIGIN_AGENT, projectRoot: workspace })[0];
+
+    const graph = load(dir);
+    const finding = [...graph.nodes.values()].find((item) => item.key === key);
+    const findingCount = [...graph.nodes.values()].filter(
+      (item) => item.kind === 'finding' && item.claim === finding.claim
+    ).length;
+    const anchors = new Set(
+      graph.edges
+        .filter((edge) => edge.from === finding.id && edge.edge === 'derived_from')
+        .map((edge) => edge.to)
+    );
+
+    expect(repeated).toBe(key);
+    expect(findingCount).toBe(1);
+    expect(anchors.size).toBe(2);
+  });
+
   test('joins a tool outcome to the exact injection id', () => {
     const injection = record(dir, {
       kind: 'inject', episodeId: 'episode-1', sessionId: 'session-1',
@@ -130,6 +165,39 @@ describe('causal episode tracing', () => {
 });
 
 describe('paired evidence report', () => {
+  test('pools raw events across project graphs before estimating cohorts', () => {
+    const secondWorkspace = mkdtempSync(join(tmpdir(), 'causal-evidence-second-'));
+    const secondDir = wikiDir(secondWorkspace);
+    try {
+      for (let pair = 1; pair <= 5; pair++) {
+        record(dir, {
+          kind: 'eval-run', taskId: 'cross-project', pairId: `p${pair}`,
+          arm: 'baseline', client: 'codex', model: 'model-a', correct: true,
+          totalTokens: 1000, toolCalls: 10,
+        });
+        record(secondDir, {
+          kind: 'eval-run', taskId: 'cross-project', pairId: `p${pair}`,
+          arm: 'full', client: 'codex', model: 'model-a', correct: true,
+          totalTokens: 600, toolCalls: 6,
+        });
+      }
+
+      const report = evidenceReportMany([dir, secondDir]);
+      const full = report.cohorts[0].effects.find((effect) =>
+        effect.arm === 'full' && effect.controlArm === 'baseline'
+      );
+      expect(full.pairs).toBe(5);
+      expect(full.totalTokensSaved.mean).toBe(400);
+      expect(report.sourceCoverage).toEqual({
+        projects: 2,
+        projectsWithEvidence: 2,
+        projectsWithoutEvidence: 0,
+      });
+    } finally {
+      rmSync(secondWorkspace, { recursive: true, force: true });
+    }
+  });
+
   test('keeps four arms separate and reports a bootstrap interval from matched pairs', () => {
     for (let pair = 1; pair <= 5; pair++) {
       for (const [arm, tokens, calls] of [

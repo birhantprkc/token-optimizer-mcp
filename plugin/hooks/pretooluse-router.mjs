@@ -12,7 +12,7 @@
  */
 
 import {
-  readPayload,
+  readPayloadResult,
   loadState,
   saveState,
   alreadyDenied,
@@ -60,6 +60,7 @@ import {
   rememberOptimizerTools,
 } from './lib/capabilities.mjs';
 import { evaluateUcrGuards } from './lib/ucr-guard.mjs';
+import { beginHookInvocation } from './lib/observability.mjs';
 
 /**
  * Largest file the hook will read to index. Above this the touch is still
@@ -68,18 +69,24 @@ import { evaluateUcrGuards } from './lib/ucr-guard.mjs';
  */
 const HARVEST_MAX_BYTES =
   Number(process.env.TOKEN_OPTIMIZER_HARVEST_MAX_BYTES) || 4_000_000;
+const invocation = beginHookInvocation('claude-code', 'pre-tool');
 
 // Wrapped whole. Any defect in this hook must cost the user nothing: an
 // exception here allows the call exactly as if the plugin were not installed.
 try {
   if (mode() === MODE_OFF) allow();
 
-  const raw = await readPayload();
-  if (!raw) allow();
+  const input = await readPayloadResult();
+  const raw = input.payload;
+  if (!raw) {
+    invocation.noteInput(input.status, input.bytes);
+    allow();
+  }
 
   // Normalized here rather than in the engine so this adapter behaves
   // identically to every other client's adapter on the same underlying call.
   const payload = normalizePayload(raw);
+  invocation.bind(raw, payload, input.bytes);
   if (!payload.tool_name) allow();
   const features = featuresForArm();
   const episode = episodeMeta({ client: 'claude-code', raw });
@@ -462,7 +469,13 @@ ${nudge}`
           // Carried through so a substitution can be told apart from a test
           // fixture later. Without it the balance sheet counted the suite's own
           // 366 fixture writes as product value.
-          { sessionId: payload.session_id }
+          {
+            sessionId: payload.session_id,
+            client: episode.client,
+            clientVersion: episode.clientVersion,
+            model: episode.model,
+            modelVersion: episode.modelVersion,
+          }
         );
         if (substitution) reason = substitution;
       }
@@ -474,6 +487,7 @@ ${nudge}`
   // On a repeat this degrades to a note and lets the call through, which is
   // what bounds the blast radius when the MCP server is unavailable.
   enforce(reason, repeat);
-} catch {
+} catch (error) {
+  invocation.fail(error);
   allow();
 }
