@@ -138,6 +138,9 @@ export async function cacheAudit(): Promise<{
 
   const trip = mods.keepwarm.tripwire(dir);
   if (trip.tripped) lines.push(`  tripwire: ${trip.reason}`);
+  else if (trip.observed > 0) {
+    lines.push(`  ledger: ${trip.reason}`);
+  }
 
   return say(lines.join('\n'));
 }

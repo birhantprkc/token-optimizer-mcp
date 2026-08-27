@@ -18,9 +18,18 @@ They ship active compression that changes operation cost directly:
 
 Delta-on-re-read is the exact mechanism I called our headline differentiator.
 They have it, and theirs is **transparent** — it happens in hooks without the
-model choosing to cooperate. Ours requires the model to reissue the call against
-`smart_read`. That is a worse interaction, not a better one, and the comment on
-#201 should be corrected.
+model choosing to cooperate. The comment on #201 should be corrected.
+
+**And the second half of that concession is now itself out of date, which is
+worth saying rather than quietly deleting.** It said ours "requires the model to
+reissue the call against `smart_read`", making it a worse interaction. Zero-turn
+substitution removed that: `substitutionFor` in `hooks-core/inject.mjs` returns
+the answer inside the refusal itself — "unchanged since your last read" when
+nothing moved, the diff when we hold a snapshot, and otherwise an annotated
+skeleton carrying the structure plus every finding anchored to it. There is no
+second call. The remaining honest difference is narrower than the original
+concession: theirs rewrites the response of a tool the model already called,
+ours refuses and answers in the refusal. Both are zero-turn.
 
 ## Where we are genuinely ahead
 
@@ -48,6 +57,13 @@ from SQLite without re-reading transcripts.
 
 We have a `PreCompact` hook that shells out to the CLI wrapper, and I have
 already flagged that it is unverified against a real compaction cycle.
+
+**Status: narrowed.** The hook now runs the out-of-band semantic harvest at
+compaction as well as at Stop, which is the half of #204's P3 that was missing:
+compaction is the event this subsystem exists for, since a conclusion not
+extracted before it is destroyed rather than merely forgotten. That is not
+checkpointing and does not claim to be — the gap below it, restoring the
+richest eligible checkpoint after compaction, is still theirs.
 
 This is worth stating plainly: **the wiki graph is a better substrate for this
 than checkpoints are** — findings are anchored, stale-checked and survive
@@ -120,13 +136,29 @@ truth for actual spend.
 ### 9. Skills and configuration health
 
 Unused-skill detection, per-skill context cost, CLAUDE.md bloat and
-cache-pattern auditing. Zero for us.
+cache-pattern auditing.
+
+**Status: built, and now visible.** "Zero for us" was wrong when it was written
+and wrong in an instructive way. `auditStanding` and `verdictFor` in
+`hooks-core/standing.mjs` already computed all four — which standing-context
+files are stale, oversized or never invoked, priced per session — and
+`renderStanding` already rendered the report. Nothing called `renderStanding`.
+The capability existed, was tested, and reached no reader, so the gap was real
+from a user's seat and closed from the code's, which is the disease this
+project's reachability guard exists to catch.
+
+It is wired now: the panel appears in `token_audit`, carrying the two things the
+finding queue cannot — the total prefix cost, and the files with nothing wrong,
+which produce no finding and were therefore invisible.
 
 ### 10. Memory health
 
 An eight-auditor MEMORY.md review with stale-entry detection. Our wiki staleness
 is conceptually the same machinery pointed at a different file; we have not
 pointed it there.
+
+**Status: unchanged.** Gap 9's machinery covers standing context, not MEMORY.md
+specifically.
 
 ### 11. Distribution and trust
 
@@ -169,3 +201,16 @@ list matches.
 But we are behind on the thing a user notices in the first five minutes, and
 "we have a better substrate" does not survive contact with a competitor whose
 dashboard shows a letter grade and a dollar figure the moment you install it.
+
+### How current this is
+
+This document is a snapshot and it has drifted before, in both directions: gap 9
+said "Zero for us" about something already built and unreachable, and the
+correction at the top overstated a concession that zero-turn substitution had
+already made untrue. Both are fixed above.
+
+The dates worth knowing: it was written against #201, corrected once on
+2026-07-31, and the statuses on gaps 1 and 9 were refreshed when the graph work
+of #204 landed. Every other entry is as first written and has not been
+re-verified against their current release, so read an unstatused gap as "true
+when written" rather than "true today".

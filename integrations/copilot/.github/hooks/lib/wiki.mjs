@@ -28,17 +28,74 @@ import { canonicalPath, isFsSafePath } from './paths.mjs';
 /**
  * Schema version stamped on every record.
  *
- * There is exactly ONE version and no migration code, because nothing has been
- * released: a graph written by an older commit of an unreleased branch is a
- * development artifact, not user data, and carrying migration paths for it costs
- * real complexity to protect something nobody has. A record from any other
- * version is skipped rather than interpreted, so a stale dev graph degrades to
- * "rebuilds from use" instead of silently mixing incompatible identities.
+ * THIS PACKAGE IS RELEASED. It ships on npm, so every graph on disk is user
+ * data. An earlier version of this comment claimed nothing had been released
+ * and used that to justify having no migration path at all -- and the reader
+ * below compared for EQUALITY, so the first bump would have discarded every
+ * existing graph in silence. That justification is gone and so is the equality:
+ * `SUPPORTED_VERSIONS` is the range this reader accepts, and `upcast` is where a
+ * shape change is absorbed in memory.
  *
- * When this does ship, a bump here is where migration would be added -- with
- * users to protect, that trade reverses.
+ * A bump here is taken only when a record's SHAPE actually changes, and it comes
+ * with a new `upcast` step and an entry in `SUPPORTED_VERSIONS` in the same
+ * change. Adding a field that older readers can ignore is not a shape change.
  */
 export const GRAPH_VERSION = 1;
+
+/**
+ * Versions this reader accepts, oldest first.
+ *
+ * A RANGE, NOT AN EQUALITY. The equality check this replaces would have
+ * discarded every existing graph the moment anyone bumped the version -- and the
+ * header once justified that with "nothing has been released", which stopped
+ * being true at v5.7.0 on npm.
+ *
+ * Nothing on disk is ever rewritten to migrate: `upcast` runs in memory during
+ * the fold, so there is no migration pass to fail halfway and no race with the
+ * concurrent sessions this store is designed for. A mixed-version log is safe
+ * precisely because the original records are never mutated, and the existing
+ * compaction retires old ones naturally as it rewrites snapshots.
+ */
+export const SUPPORTED_VERSIONS = [1];
+
+/**
+ * Brings one record up to the current version. Pure, and one step per version.
+ *
+ * Identity today because GRAPH_VERSION is 1 and no shape has changed. It exists
+ * now so the first change that DOES need it has somewhere to go other than an
+ * equality check that silently deletes user data.
+ *
+ * CONTRACT for the first non-identity step:
+ *  - It must be IDEMPOTENT. `upcast(upcast(r))` must equal `upcast(r)`, because
+ *    compaction upcasts a record to key it and `load` upcasts the same record
+ *    again on every subsequent read. A step that is not idempotent applies twice
+ *    to anything compaction has touched.
+ *  - It must NOT be relied on to restamp `v`. Nothing in this file writes an
+ *    upcast record back to disk under a version it did not come from; the
+ *    version stamp on disk is always the one that wrote the bytes. See the
+ *    per-branch comments in `compactIfWasteful`.
+ */
+export function upcast(record) {
+  return record;
+}
+
+/**
+ * True when this reader can interpret the record at all.
+ *
+ * `versions` is a PARAMETER so the range semantics are testable independently of
+ * today's constants. With `SUPPORTED_VERSIONS = [1]` and `GRAPH_VERSION = 1` a
+ * range check and the old equality check are extensionally identical, so a test
+ * pinned to the live constants cannot tell them apart -- and cannot fail if
+ * someone reverts this to an equality. Exercised against `[1, 2]`, it can.
+ */
+export function readable(record, versions = SUPPORTED_VERSIONS) {
+  const version = record.v ?? 0;
+  // Forward-incompatible records are skipped: a v-from-the-future was written by
+  // a newer client and we cannot know its shape. Ignoring the future is safe for
+  // a READER -- but see `compactIfWasteful`, where "ignore" would mean "delete",
+  // because compaction rewrites the files it reads.
+  return versions.includes(version);
+}
 
 /** Node kinds. `file` and `symbol` are first-class so staleness can propagate. */
 export const NODE_KINDS = ['file', 'symbol', 'task', 'finding'];
@@ -396,9 +453,20 @@ function compactIfWasteful(dir) {
     const nodes = new Map();
     const edges = new Map();
     const snaps = new Map();
-    for (const rec of readSnapshots(dir)) {
+    // KEPT VERBATIM THROUGH THE REBUILD, exactly as the main log keeps what it
+    // cannot parse. These lines are not evictable by the snapshot budget below
+    // because their size cannot be attributed to an id we understand -- and
+    // preserving bytes we may not need is strictly better than deleting bytes a
+    // newer client does. They stop accumulating as soon as the client that
+    // wrote them compacts, since it can read and dedupe them.
+    const sidecar = readSnapshots(dir);
+    const rawSnaps = sidecar.unreadable;
+    for (const rec of sidecar.records) {
       if (typeof rec.snapshot === 'string' && rec.snapshot) {
-        snaps.set(rec.id, { at: rec.at || 0, snapshot: rec.snapshot });
+        // `v` IS CARRIED, not restamped. Writing GRAPH_VERSION over a record
+        // from another version mislabels bytes this reader did not produce, and
+        // the label is the only thing a future reader has to go on.
+        snaps.set(rec.id, { at: rec.at || 0, snapshot: rec.snapshot, v: rec.v ?? GRAPH_VERSION });
       }
     }
     for (const line of readFileSync(path, 'utf8').split('\n')) {
@@ -409,29 +477,51 @@ function compactIfWasteful(dir) {
       } catch {
         continue;
       }
-      // A record from another schema is KEPT VERBATIM rather than reinterpreted.
-      // load() skips it, but discarding it here would make compaction a silent
-      // migration that deletes data a future version might understand.
-      if ((record.v ?? 0) !== GRAPH_VERSION) {
+      // A record this reader cannot interpret is KEPT VERBATIM rather than
+      // reinterpreted. load() skips it, but discarding it here would make
+      // compaction a silent migration that deletes data a future version might
+      // understand. THE RANGE MATTERS HERE TOO: with an equality check, a bump
+      // would have parked every existing v1 record in `raw`, undeduplicated, so
+      // compaction would stop reclaiming anything and inline snapshots would
+      // never migrate out -- the same loss by a second route.
+      if (!readable(record)) {
         edges.set('raw:' + edges.size, line);
         continue;
       }
-      if (record.t === 'n') {
+      // TWO OBJECTS, ON PURPOSE. `record` is exactly what the bytes on disk say;
+      // `view` is the in-memory current-shape reading of it, used only to KEY and
+      // CLASSIFY. Nothing derived from `view` is ever serialized, because
+      // compaction reclaims superseded records -- it does not migrate surviving
+      // ones -- so every version stamp it writes is the one that wrote the bytes.
+      //
+      // An earlier revision of this comment claimed "the ORIGINAL line is written
+      // back" for the whole block. That was FALSE for the inline-snapshot branch,
+      // which re-serializes. It re-serialized the upcast object while carrying
+      // the old `v`, so the first non-identity `upcast` would have written
+      // new-shape bytes under an old label and every later `load` would have
+      // upcast them a second time. Hence: strip from `record`, never from `view`.
+      const view = upcast(record);
+      if (view.t === 'n') {
         // MIGRATION. Graphs written before snapshots were split still carry
         // them inline, and those are exactly the graphs that are slow. Moving
         // them out here means one compaction fixes an existing install.
+        //
+        // THE ONLY RE-SERIALIZING BRANCH in this loop. It writes the original
+        // record minus its snapshot, so the surviving bytes keep their own shape
+        // and their own `v`, and the snapshot moved to the sidecar carries the
+        // same `v` as the node it came out of.
         if (typeof record.snapshot === 'string' && record.snapshot) {
           const { snapshot, ...rest } = record;
-          nodes.set(record.id, JSON.stringify(rest));
-          snaps.set(record.id, { at: record.at || 0, snapshot });
+          nodes.set(view.id, JSON.stringify(rest));
+          snaps.set(view.id, { at: record.at || 0, snapshot, v: record.v ?? GRAPH_VERSION });
         } else {
-          nodes.set(record.id, line);
+          nodes.set(view.id, line);
         }
-      } else if (record.t === 's') {
+      } else if (view.t === 's') {
         if (typeof record.snapshot === 'string' && record.snapshot) {
-          snaps.set(record.id, { at: record.at || 0, snapshot: record.snapshot });
+          snaps.set(view.id, { at: record.at || 0, snapshot: record.snapshot, v: record.v ?? GRAPH_VERSION });
         }
-      } else if (record.t === 'e') edges.set(`${record.from}|${record.edge}|${record.to}`, line);
+      } else if (view.t === 'e') edges.set(`${view.from}|${view.edge}|${view.to}`, line);
       else edges.set('raw:' + edges.size, line);
     }
 
@@ -494,10 +584,20 @@ function compactIfWasteful(dir) {
     renameSync(tmp, path);
     // The surviving snapshots are rewritten to their own file, which is also
     // what migrates a graph that still had them inline.
-    const snapOut =
-      [...keep.entries()]
-        .map(([id, v]) => JSON.stringify({ t: 's', v: GRAPH_VERSION, id, snapshot: v.snapshot, at: v.at }))
-        .join('\n') + (keep.size ? '\n' : '');
+    //
+    // UNREADABLE LINES FIRST AND VERBATIM. This rebuild replaces the file, so
+    // anything omitted here is deleted permanently -- which made the missing
+    // counterpart to the main log's `raw:` bucket a real data-loss path, not a
+    // theoretical one. Each survivor also keeps ITS OWN `v` rather than being
+    // restamped to GRAPH_VERSION, so no record is relabelled as something this
+    // reader wrote.
+    const snapLines = [
+      ...rawSnaps,
+      ...[...keep.entries()].map(([id, s]) =>
+        JSON.stringify({ t: 's', v: s.v ?? GRAPH_VERSION, id, snapshot: s.snapshot, at: s.at })
+      ),
+    ];
+    const snapOut = snapLines.join('\n') + (snapLines.length ? '\n' : '');
     const snapTmp = snapshotsPath(dir) + '.compact';
     writeFileSync(snapTmp, snapOut, { mode: 0o600 });
     renameSync(snapTmp, snapshotsPath(dir));
@@ -642,23 +742,60 @@ function appendSnapshot(dir, record) {
   }
 }
 
-/** Every snapshot record, latest wins. Read only when a caller asks. */
+/**
+ * Every snapshot record, latest wins. Read only when a caller asks.
+ *
+ * `unreadable` collects the RAW LINES this reader rejected, and it is the reason
+ * this function reports them at all rather than just dropping them. `load` has
+ * no use for them -- a reader that cannot interpret a record must ignore it --
+ * but `compactIfWasteful` REBUILDS this file from what it read, so for the
+ * compactor "ignore" and "delete permanently" are the same operation. The main
+ * log already keeps what it cannot parse (the `raw:` bucket); the sidecar had no
+ * equivalent, which made it the one asymmetric, destructive path in an otherwise
+ * append-only store.
+ *
+ * This is not hypothetical here: hooks-core is vendored into eleven client
+ * directories that update independently, so a stale client compacting a graph a
+ * newer client has already written to is the expected steady state, not an edge
+ * case.
+ */
 function readSnapshots(dir) {
-  const out = [];
+  /** @type {object[]} */ const out = [];
+  /** @type {string[]} */ const unreadable = [];
   try {
     for (const line of readFileSync(snapshotsPath(dir), 'utf8').split('\n')) {
       if (!line) continue;
       try {
         const rec = JSON.parse(line);
-        if ((rec.v ?? 0) === GRAPH_VERSION && rec.id) out.push(rec);
+        // THE SAME RANGE AS THE MAIN LOG, deliberately. An equality check here
+        // was the quietest of the three: a bump would have made every stored
+        // snapshot unreadable, and the very next compaction would have deleted
+        // them for good.
+        if (!readable(rec)) {
+          unreadable.push(line);
+          continue;
+        }
+        // A RECORD WITH NO `id` IS KEPT VERBATIM, NOT DROPPED SILENTLY. It
+        // cannot be attributed to a node, so it is useless to `load` -- but this
+        // used to put it in neither bucket, and `compactIfWasteful` rebuilds the
+        // sidecar from `records` plus `unreadable`, so a line in neither was
+        // deleted permanently by the next compaction. That is the same shape as
+        // the Critical this reader's version check already fixed, and the same
+        // asymmetry: for the compactor, "ignore" and "destroy" are one operation.
+        // Unreachable today because every writer sets `id`; a reader is not the
+        // right place to rely on that.
+        if (rec.id) out.push(upcast(rec));
+        else unreadable.push(line);
       } catch {
-        /* a torn line costs one snapshot */
+        // A torn line costs one snapshot -- and it is NOT preserved, because a
+        // half-written line is not a record from another version, it is
+        // garbage. Distinguishing the two is the whole point of parsing first.
       }
     }
   } catch {
     /* no sidecar yet */
   }
-  return out;
+  return { records: out, unreadable };
 }
 
 /**
@@ -691,7 +828,12 @@ export function load(dir, { snapshots = false } = {}) {
       if (!snapshots) continue;
       try {
         const rec = JSON.parse(line);
-        if ((rec.v ?? 0) === GRAPH_VERSION) pending.set(rec.id, rec.snapshot);
+        // Inline snapshots from an older graph: same range, same reason. These
+        // are precisely the records most likely to predate a bump.
+        if (readable(rec)) {
+          const snap = upcast(rec);
+          pending.set(snap.id, snap.snapshot);
+        }
       } catch {
         /* a torn line costs one snapshot, not the graph */
       }
@@ -703,10 +845,14 @@ export function load(dir, { snapshots = false } = {}) {
     } catch {
       continue;
     }
-    // A record from another schema is skipped, not interpreted: its ids and
-    // hashes were derived differently, so honouring it produces confident
-    // nonsense rather than a visible error.
-    if ((record.v ?? 0) !== GRAPH_VERSION) continue;
+    // A record this reader cannot interpret is skipped, not guessed at: a
+    // version from the FUTURE derived its ids and hashes in a way we do not
+    // know, so honouring it produces confident nonsense rather than a visible
+    // error. A record from the PAST is upcast, never skipped -- skipping it is
+    // data loss, and this comparison used to be an equality, which made the
+    // first version bump a silent delete of every graph on disk.
+    if (!readable(record)) continue;
+    record = upcast(record);
     if (record.t === 'n') nodes.set(record.id, record);
     else if (record.t === 'e') edges.push(record);
   }
@@ -715,7 +861,9 @@ export function load(dir, { snapshots = false } = {}) {
   // Re-attached after the sweep, so a snapshot record may appear before or
   // after the node it belongs to.
   if (pending) {
-    for (const rec of readSnapshots(dir)) pending.set(rec.id, rec.snapshot);
+    // A reader has no use for the lines it could not interpret; only the
+    // compactor does, because only the compactor rewrites the file.
+    for (const rec of readSnapshots(dir).records) pending.set(rec.id, rec.snapshot);
     for (const [id, snapshot] of pending) {
       const node = nodes.get(id);
       if (node) nodes.set(id, { ...node, snapshot });
@@ -726,27 +874,135 @@ export function load(dir, { snapshots = false } = {}) {
 }
 
 /**
+ * The sha256 of nothing.
+ *
+ * Every empty file in a repository shares this hash, and they are not the same
+ * file in any sense a reader cares about -- a `.gitkeep` beside an empty
+ * `index.js` beside a placeholder test. Grouping them would make one finding
+ * about one empty file surface on every other, which is noise wearing the
+ * shape of a feature.
+ */
+const EMPTY_CONTENT_HASH = 'e3b0c44298fc1c14';
+
+/**
+ * How many identical copies of one file are followed.
+ *
+ * A vendored core in eleven directories is the case this exists for; a
+ * generated asset checked in five hundred times is the case that would turn one
+ * retrieval into a scan. The cap is far above any real vendoring and far below
+ * anything pathological, and it is applied to the PEERS rather than to the
+ * findings so the ranking below still chooses among a full candidate set.
+ */
+const MAX_CONTENT_PEERS = 32;
+
+/**
+ * Other paths in THIS graph holding byte-identical content to `anchorId`.
+ *
+ * WHY CONTENT IS NOT A SECOND IDENTITY. The obvious implementation of #319 --
+ * the deleted `contentAnchor` -- minted a second anchor id of the form
+ * `content:<hash>:<size>`, and that is the one thing this codebase has already
+ * been burned by: `canonicalKey` lives INSIDE `nodeId` precisely because a
+ * caller that forgot produced a second node for a file that already existed and
+ * split its findings invisibly. A second identity for the same file is that
+ * defect by construction.
+ *
+ * So nothing new is stored and no node is created. A file node already carries
+ * the sha256 of its contents, because staleness needs it -- content identity
+ * has been sitting in the graph since P2. This is an index over what is already
+ * there, which means it cannot split a history: there is still exactly one node
+ * per path, and a finding still has exactly one set of `derived_from` edges.
+ *
+ * STALENESS IS UNAFFECTED, and follows the path exactly as before. That falls
+ * out rather than being decided: content identity IS the hash, so a file whose
+ * bytes change simply stops matching the group and starts matching whichever
+ * group its new bytes belong to. There is no such thing as a stale content
+ * anchor to invalidate.
+ *
+ * SCOPE IS ONE GRAPH, deliberately. This can only ever surface findings that
+ * are already in the graph being read, so it opens no path between projects and
+ * changes nothing about `fleet.mjs` or the shared tier, which remain the only
+ * cross-project transfer and keep their own gates. See docs/WIKI_GRAPH.md for
+ * why the cross-repository half of #319 needs a storage decision this does not
+ * take.
+ */
+export function contentPeers(graph, anchorId) {
+  const anchor = graph.nodes.get(anchorId);
+  if (!anchor || anchor.kind !== 'file') return [];
+
+  const hash = typeof anchor.hash === 'string' ? anchor.hash : '';
+  // A file node minted for an IMPORT TARGET carries no hash at all -- see
+  // `indexFile`, which creates one for every resolved import without reading
+  // it. Grouping on a missing hash would make every unread import in the
+  // repository one content group, which is the largest possible wrong answer.
+  if (!hash || hash === EMPTY_CONTENT_HASH) return [];
+
+  const peers = [];
+  for (const node of graph.nodes.values()) {
+    if (peers.length >= MAX_CONTENT_PEERS) break;
+    if (node.kind !== 'file' || node.id === anchorId) continue;
+    if (node.hash !== hash) continue;
+
+    // THE HASH IS TRUNCATED TO 64 BITS -- `staleness.mjs` slices the sha256 to
+    // sixteen hex characters -- so equal hashes are strong evidence of equal
+    // content and not proof of it, and two unrelated files sharing a digest
+    // would silently share each other's findings. The deleted `contentAnchor`
+    // carried a size beside the digest for exactly this reason, and `indexFile`
+    // now records one.
+    //
+    // ABSENCE IS PERMISSIVE, and deliberately. A node written before `bytes`
+    // existed, or one minted for an import target and never read, has none --
+    // and refusing to group those would make the feature quietly stop working
+    // on every graph that predates it, healing only as files happen to be
+    // touched. Where both sides know their size they must agree.
+    const mine = anchor.bytes;
+    const theirs = node.bytes;
+    if (typeof mine === 'number' && typeof theirs === 'number' && mine !== theirs) continue;
+
+    peers.push(node.id);
+  }
+  return peers;
+}
+
+/**
  * Findings reachable from a file or symbol, by traversal.
  *
  * This is the retrieval primitive the whole design rests on -- no embeddings,
  * no vector index. It follows `derived_from` edges backwards from an anchor to
  * the findings that depend on it, then one hop further through `contains` so
  * that touching a file also surfaces findings about the symbols inside it.
+ *
+ * AND ACROSS IDENTICAL COPIES. A vendored file is the same file wherever it
+ * sits, whatever path each copy is given, so a finding about one copy is a
+ * finding about all of them. This repository is its own example: the shared
+ * hook core is vendored into eleven directories, byte-identical, and until now
+ * a finding recorded against one of them was invisible from the other ten.
+ * `contentPeers` explains why this is an index rather than a second identity.
  */
 export function findingsFor(graph, anchorId, { limit = 20 } = {}) {
-  const anchors = new Set([anchorId]);
+  const anchors = new Set([anchorId, ...contentPeers(graph, anchorId)]);
   for (const edge of graph.edges) {
-    if (edge.edge === 'contains' && edge.from === anchorId) anchors.add(edge.to);
+    // Symbols are expanded from every anchor, not only the one asked for: a
+    // finding about a function inside a vendored file is exactly as applicable
+    // in the copy the reader is actually touching.
+    if (edge.edge === 'contains' && anchors.has(edge.from)) anchors.add(edge.to);
   }
 
   const found = [];
+  // DEDUPED BY ID. A finding can now be reached more than once -- through a file
+  // and a symbol it contains, or through two identical copies of the same file
+  // -- and returning it twice would spend the injection budget twice on one
+  // claim and let it outrank a rival by being duplicated.
+  const seen = new Set();
   for (const edge of graph.edges) {
     if (edge.edge !== 'derived_from' || !anchors.has(edge.to)) continue;
     const node = graph.nodes.get(edge.from);
     // Retired findings are excluded at the SOURCE so no consumer has to
     // remember to filter them. A withdrawn claim reaching a model through some
     // path that forgot is the failure this centralisation prevents.
-    if (node && node.kind === 'finding' && !node.retired) found.push(node);
+    if (!node || node.kind !== 'finding' || node.retired) continue;
+    if (seen.has(node.id)) continue;
+    seen.add(node.id);
+    found.push(node);
   }
 
   // Ranked by confidence x recency, per the design. The hard token budget that

@@ -9,9 +9,10 @@
  * the prefix is stable by construction rather than by hope.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import {
   readCacheUsage,
   cacheHealth,
@@ -29,12 +30,19 @@ import {
   ttlTier,
   tripwire,
   shouldKeepWarm,
+  recordRefresh,
   recordRefreshOutcome,
+  scoreRefreshes,
+  observedHitRates,
   TIERS,
   TRIPWIRE_MIN,
+  OBSERVATION_FLOOR,
+  TURN_GAP_MS,
 } from '../../hooks-core/keepwarm.mjs';
-import { record, readMetrics } from '../../hooks-core/metrics.mjs';
+import { record, readMetrics, readBalance } from '../../hooks-core/metrics.mjs';
 import { policyText } from '../../hooks-core/adapter.mjs';
+import { sessionContext } from '../../hooks-core/inject.mjs';
+import { putNode } from '../../hooks-core/wiki.mjs';
 
 let workspace;
 let dir;
@@ -43,7 +51,6 @@ beforeEach(() => {
   workspace = mkdtempSync(join(tmpdir(), 'cache-'));
   dir = join(workspace, '.token-optimizer', 'wiki');
 });
-
 afterEach(() => rmSync(workspace, { recursive: true, force: true }));
 
 /** A transcript in the client's own format. */
@@ -313,6 +320,308 @@ describe('the tripwire stays underneath the expected-value decision', () => {
   });
 });
 
+describe('a refresh finds out whether it bought anything', () => {
+  /** A refresh recorded at a chosen moment, as an issuer would record it. */
+  const issue = (at, extra = {}) =>
+    recordRefresh(dir, {
+      tier: '5m',
+      prefixTokens: 20_000,
+      expectedValue: 1,
+      sessionId: 's1',
+      at,
+      ...extra,
+    });
+
+  /** A turn, through the real producer, so both logs see it. */
+  const turn = (at, sessionId = 's1') => record(dir, { kind: 'read', at, sessionId });
+
+  const outcomes = () =>
+    readBalance(dir).filter((e) => e.kind === 'keepwarm' && e.action === 'outcome');
+
+  test('a turn arriving before expiry is recorded as a hit', () => {
+    const at = Date.now() - 10 * 60 * 1000;
+    issue(at);
+    turn(at + 60_000);
+
+    const summary = scoreRefreshes(dir);
+    expect([summary.scored, summary.hits]).toEqual([1, 1]);
+    expect(outcomes().map((o) => [o.hit, o.tier])).toEqual([[true, '5m']]);
+  });
+
+  test('a window that closed with no turn in it is a real miss', () => {
+    const at = Date.now() - 10 * 60 * 1000;
+    issue(at);
+    // Six minutes later: the 5m entry had already lapsed, so this arrival is
+    // evidence the window closed unused rather than evidence of a hit.
+    turn(at + 6 * 60 * 1000);
+
+    const summary = scoreRefreshes(dir);
+    expect([summary.scored, summary.hits]).toEqual([1, 0]);
+    expect(outcomes().map((o) => o.hit)).toEqual([false]);
+  });
+
+  test('a hit is not scored before its window closes, or hits would be counted first', () => {
+    // RIGHT-CENSORING, which is the way this measurement flatters itself.
+    // Scoring a hit the moment it arrives while a miss has to wait out the
+    // whole TTL means that at any instant the recorded hits are complete and
+    // the recorded misses are not.
+    const at = Date.now() - 60_000;
+    issue(at);
+    turn(at + 10_000);
+
+    const summary = scoreRefreshes(dir);
+    expect([summary.scored, summary.pending]).toEqual([0, 1]);
+    expect(outcomes()).toEqual([]);
+  });
+
+  test('a refresh with no arrival evidence records nothing rather than a miss', () => {
+    const at = Date.now() - 10 * 60 * 1000;
+    issue(at);
+
+    // The firehose window has moved past the period an answer would need. An
+    // absent signal is not a miss: counting it as one biases every rate
+    // downward and would eventually switch keep-warm off on no evidence.
+    const summary = scoreRefreshes(dir, {
+      arrivals: () => [{ kind: 'read', at: Date.now(), sessionId: 's1' }],
+    });
+    expect([summary.scored, summary.uncovered]).toEqual([0, 1]);
+    expect(outcomes()).toEqual([]);
+  });
+
+  test('a refresh naming no session is not scored, because no arrival belongs to it', () => {
+    const at = Date.now() - 10 * 60 * 1000;
+    issue(at, { sessionId: null });
+    turn(at + 60_000);
+
+    const summary = scoreRefreshes(dir);
+    expect([summary.scored, summary.unattributable]).toEqual([0, 1]);
+    expect(outcomes()).toEqual([]);
+  });
+
+  test('a refresh that cannot be paired is not scored, or it would be scored forever', () => {
+    // No id, so no outcome could ever name it -- and an outcome that names
+    // nothing is one more row on the ledger at the end of every turn, forever.
+    // Everything else about this refresh is scoreable: the window has closed,
+    // the arrival log covers it, and a turn did arrive inside it.
+    const at = Date.now() - 10 * 60 * 1000;
+    const summary = scoreRefreshes(dir, {
+      refreshes: [
+        {
+          kind: 'keepwarm',
+          action: 'refresh',
+          tier: '5m',
+          prefixTokens: 20_000,
+          sessionId: 's1',
+          at,
+        },
+      ],
+      arrivals: () => [
+        { kind: 'keepwarm', action: 'refresh', at, sessionId: 's1' },
+        { kind: 'read', at: at + 60_000, sessionId: 's1' },
+      ],
+    });
+    expect([summary.scored, summary.unattributable]).toEqual([0, 1]);
+  });
+
+  test('each refresh is scored once, not once per turn', () => {
+    const at = Date.now() - 10 * 60 * 1000;
+    issue(at);
+    turn(at + 60_000);
+
+    scoreRefreshes(dir);
+    expect(scoreRefreshes(dir).scored).toBe(0);
+    expect(outcomes()).toHaveLength(1);
+  });
+
+  test('the firehose is not read when there is no refresh to score', () => {
+    // The dormant cost of this loop is one small file, not a 2 MB tail read on
+    // every turn of every session on a machine that never refreshes anything.
+    turn(Date.now() - 60_000);
+    let reads = 0;
+    const summary = scoreRefreshes(dir, {
+      arrivals: () => {
+        reads += 1;
+        return [];
+      },
+    });
+    expect([reads, summary.scored, summary.pending]).toEqual([0, 0, 0]);
+  });
+
+  test("keep-warm's own bookkeeping does not count as a turn arrival", () => {
+    const at = Date.now() - 10 * 60 * 1000;
+    issue(at);
+    const summary = scoreRefreshes(dir, {
+      arrivals: () => [
+        { kind: 'keepwarm', action: 'refresh', at, sessionId: 's1' },
+        { kind: 'keepwarm', action: 'outcome', at: at + 60_000, sessionId: 's1' },
+      ],
+    });
+    expect([summary.scored, summary.hits]).toEqual([1, 0]);
+  });
+
+  test('a burst inside the same turn is not an arrival', () => {
+    const at = Date.now() - 10 * 60 * 1000;
+    issue(at);
+    turn(at + TURN_GAP_MS - 50);
+    turn(at + 6 * 60 * 1000);
+    expect(scoreRefreshes(dir).hits).toBe(0);
+  });
+
+  test('the window is the tier the refresh was bought at', () => {
+    const at = Date.now() - 2 * 60 * 60 * 1000;
+    issue(at, { tier: '1h' });
+    turn(at + 30 * 60 * 1000);
+    const summary = scoreRefreshes(dir);
+    expect([summary.scored, summary.hits]).toEqual([1, 1]);
+  });
+
+  test('the Stop hook scores refreshes, so the loop has a live call site', () => {
+    // THE HALF THAT WAS MISSING. Both recorders were correct, tested and called
+    // by nothing, so the decision could never learn. Spawned rather than
+    // imported: an in-process call proves the function works, not that anything
+    // runs it.
+    const project = mkdtempSync(join(tmpdir(), 'kw-stop-'));
+    mkdirSync(join(project, '.git'), { recursive: true });
+    try {
+      const at = Date.now() - 10 * 60 * 1000;
+      issue(at);
+      turn(at + 60_000);
+
+      const r = spawnSync(
+        process.execPath,
+        [join(process.cwd(), 'plugin', 'hooks', 'stop.mjs')],
+        {
+          input: JSON.stringify({ cwd: project, session_id: 'stop-session' }),
+          encoding: 'utf8',
+          timeout: 30_000,
+          env: {
+            ...process.env,
+            TOKEN_OPTIMIZER_WIKI_DIR: dir,
+            TOKEN_OPTIMIZER_SHARED_DIR: dir,
+            TOKEN_OPTIMIZER_STATE_DIR: join(project, '.state'),
+            TOKEN_OPTIMIZER_PROJECT_REGISTRY: join(project, 'projects.jsonl'),
+            CLAUDE_PROJECT_DIR: project,
+          },
+        }
+      );
+      expect(r.status).toBe(0);
+      expect(outcomes().map((o) => o.hit)).toEqual([true]);
+    } finally {
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the keep-warm decision reads what the refreshes actually did', () => {
+  /** Turns `gapMs` apart, through the real producer. */
+  const seedTurns = (gapMs, count = 20) => {
+    const base = Date.now() - count * gapMs;
+    for (let i = 0; i < count; i++) record(dir, { kind: 'read', at: base + i * gapMs });
+  };
+
+  const seedOutcomes = (hits, misses, tier = '5m') => {
+    for (let i = 0; i < hits + misses; i++)
+      recordRefreshOutcome(dir, { tier, prefixTokens: 20_000, hit: i < hits });
+  };
+
+  const observed = () => observedHitRates(readBalance(dir));
+
+  test('ten refreshes that never bought a read stop it recommending one', () => {
+    // Gaps just past the TTL: the ping model says refresh, and until now
+    // nothing could contradict it.
+    seedTurns(7 * 60 * 1000);
+    const gaps = gapDistribution(dir);
+    expect(keepWarmDecision({ prefixTokens: 20_000, gaps }).action).toBe('refresh');
+
+    seedOutcomes(0, OBSERVATION_FLOOR);
+    const decision = keepWarmDecision({ prefixTokens: 20_000, gaps, observed: observed() });
+    expect(decision.action).toBe('skip');
+    expect(decision.observedHitRate).toBe(0);
+    expect(decision.reason).toMatch(/10 observed refreshes/);
+  });
+
+  test('an observed hit rate may lower the modelled probability and never raise it', () => {
+    // Every gap inside the TTL, so a ping buys nothing: the entry was warm
+    // anyway. A recorded `hit` only says a turn arrived before expiry -- it
+    // cannot say the ping is what kept the entry alive, so it is an UPPER bound
+    // on the ping's value and must never be substituted for the model.
+    seedTurns(30_000);
+    const gaps = gapDistribution(dir);
+    const plain = keepWarmDecision({ prefixTokens: 20_000, gaps });
+    expect(plain.action).toBe('skip');
+
+    seedOutcomes(OBSERVATION_FLOOR, 0);
+    const withObservations = keepWarmDecision({
+      prefixTokens: 20_000,
+      gaps,
+      observed: observed(),
+    });
+    expect(withObservations.action).toBe('skip');
+    expect(withObservations.probability).toBe(plain.probability);
+  });
+
+  test('a perfect observed record cannot make a tier that never pays pay', () => {
+    seedTurns(6 * 60 * 60 * 1000);
+    seedOutcomes(OBSERVATION_FLOOR, 0);
+    expect(
+      ttlTier({ prefixTokens: 20_000, gaps: gapDistribution(dir), observed: observed() })
+    ).toBeNull();
+  });
+
+  test('an observed hit rate moves the tier chooser off the tier that missed', () => {
+    seedTurns(30_000);
+    expect(ttlTier({ prefixTokens: 20_000, gaps: gapDistribution(dir) }).tier).toBe('5m');
+
+    seedOutcomes(2, OBSERVATION_FLOOR - 2);
+    const best = ttlTier({
+      prefixTokens: 20_000,
+      gaps: gapDistribution(dir),
+      observed: observed(),
+    });
+    // Observations bind the tier they were measured at, and only that tier.
+    expect(best.tier).toBe('1h');
+  });
+
+  test('when every tier has missed, no tier pays and it says so', () => {
+    seedTurns(30_000);
+    seedOutcomes(0, OBSERVATION_FLOOR, '5m');
+    seedOutcomes(0, OBSERVATION_FLOOR, '1h');
+    expect(
+      ttlTier({ prefixTokens: 20_000, gaps: gapDistribution(dir), observed: observed() })
+    ).toBeNull();
+  });
+
+  test('a single unlucky miss cannot switch keep-warm off', () => {
+    seedTurns(30_000);
+    seedOutcomes(0, 1);
+    expect(observed().size).toBe(0);
+    expect(shouldKeepWarm(dir, { prefixTokens: 20_000 }).action).toBe('refresh');
+  });
+
+  test('the floor is the same evidence the backstop demands', () => {
+    seedOutcomes(0, OBSERVATION_FLOOR - 1);
+    expect(observed().size).toBe(0);
+    seedOutcomes(0, 1);
+    expect(observed().get('5m')).toEqual({ refreshes: 10, hits: 0, rate: 0 });
+    expect(OBSERVATION_FLOOR).toBe(TRIPWIRE_MIN);
+  });
+
+  test('the shipped decision reads the observations without the tripwire doing it', () => {
+    seedTurns(30_000);
+    expect(shouldKeepWarm(dir, { prefixTokens: 20_000 }).action).toBe('refresh');
+
+    // Two used in ten at each tier. The realised ledger is still POSITIVE, so
+    // the backstop has no opinion: if the verdict moves, the decision moved it.
+    seedOutcomes(2, OBSERVATION_FLOOR - 2, '5m');
+    seedOutcomes(2, OBSERVATION_FLOOR - 2, '1h');
+    expect(tripwire(dir).tripped).toBe(false);
+
+    const out = shouldKeepWarm(dir, { prefixTokens: 20_000 });
+    expect(out.action).toBe('skip');
+    expect(out.trippedWire).toBeUndefined();
+  });
+});
+
 describe('our own contribution to the prefix is stable by construction', () => {
   test('a volatile line in our own output is dropped, not emitted', () => {
     // We do not merely observe the cache, we write into it. Failing closed is
@@ -568,5 +877,158 @@ describe('a gap between two sessions is not a gap between turns', () => {
     const gaps = gapDistribution(dir);
     expect(gaps.median).toBeGreaterThan(60 * 60_000);
     expect(ttlTier({ prefixTokens: 47_000, gaps })).toBeNull(); // and it correctly declines
+  });
+});
+
+/**
+ * The ordering that makes the economics bite.
+ *
+ * `cacheOrdered` was correct and had zero call sites, so the SessionStart
+ * assembly was ordered by whatever sequence its call sites happened to push in.
+ * These tests are about the ASSEMBLY, not the sort: a unit test of the sort
+ * passed before this was wired and would pass again if the call were deleted.
+ *
+ * The property that actually costs money is the last one -- a change confined to
+ * a volatile block must leave every byte ahead of it identical, because a prefix
+ * cache invalidates from the first difference onward.
+ */
+describe('SessionStart context is assembled in cache order', () => {
+  // The numbers are the contract. An earlier draft of this work used 'high' and
+  // 'low' strings; those subtract to NaN, every comparison returns false, and
+  // Array.prototype.sort leaves the input untouched -- a silent no-op that a
+  // test written against an already-sorted input would have passed.
+  test('volatility is numeric, and a non-numeric taxonomy would be a silent no-op', () => {
+    const numeric = cacheOrdered([
+      { id: 'volatile', volatility: 2 },
+      { id: 'stable', volatility: 0 },
+    ]);
+    expect(numeric.map((b) => b.id)).toEqual(['stable', 'volatile']);
+
+    // Documented, not endorsed: this is what the string version would have done.
+    const strings = cacheOrdered([
+      { id: 'volatile', volatility: 'high' },
+      { id: 'stable', volatility: 'low' },
+    ]);
+    expect(Number('high') - Number('low')).toBeNaN();
+    expect(strings.map((b) => b.id)).toEqual(['volatile', 'stable']);
+  });
+
+  test('sorts the assembled blocks, so insertion order cannot decide the prefix', () => {
+    // Pushed WORST FIRST on purpose. If the assembly merely joined its inputs
+    // this would emit the freshest block at the very front of the prefix, which
+    // is the expensive arrangement.
+    const text = sessionContext([
+      { id: 'restoration', volatility: 3, text: 'RESTORATION' },
+      { id: 'index', volatility: 2, text: 'INDEX' },
+      { id: 'standing', volatility: 1, text: 'STANDING' },
+      { id: 'policy', volatility: 0, text: 'POLICY' },
+    ]);
+    expect(text).toBe('POLICY\n\nSTANDING\n\nINDEX\n\nRESTORATION');
+  });
+
+  test('drops empty blocks instead of opening the prefix with a blank line', () => {
+    // Fail open: an unreadable graph yields no standing block and no index, and
+    // the policy notice must still arrive as the first byte of the prefix.
+    expect(
+      sessionContext([
+        { id: 'index', volatility: 2, text: '' },
+        { id: 'policy', volatility: 0, text: 'POLICY' },
+        { id: 'standing', volatility: 1, text: '   ' },
+        null,
+      ])
+    ).toBe('POLICY');
+    expect(sessionContext([])).toBe('');
+  });
+
+  test('a change to a volatile block leaves the stable prefix byte-identical', () => {
+    // THIS IS THE CLAIM, tested on the bytes the hook actually emits rather than
+    // on the sort. Two sessions over the same graph, differing only in the task
+    // text, select different findings for the wiki index. If the ordering works,
+    // everything ahead of that index -- policy notice, project briefing and
+    // standing rules -- is the same bytes both times, so the cache keeps it.
+    const project = mkdtempSync(join(tmpdir(), 'cache-order-'));
+    const graphDir = join(project, '.token-optimizer', 'wiki');
+    mkdirSync(graphDir, { recursive: true });
+
+    putNode(graphDir, {
+      kind: 'finding',
+      key: 'p1',
+      pinned: true,
+      confidence: 0.9,
+      claim: 'Build against an isolated worktree, never live WIP.',
+    });
+    putNode(graphDir, {
+      kind: 'finding',
+      key: 'runner',
+      type: 'command',
+      trigger: 'jest',
+      confidence: 0.95,
+      claim: 'Run npm test, not npx jest; the jest binary ignores our runner settings.',
+    });
+    putNode(graphDir, {
+      kind: 'finding',
+      key: 'bundler',
+      type: 'command',
+      trigger: 'webpack',
+      confidence: 0.95,
+      claim: 'The webpack bundler emits everything below tools/bundle.',
+    });
+
+    const run = (userPrompt) => {
+      const r = spawnSync(
+        process.execPath,
+        [join(process.cwd(), 'plugin', 'hooks', 'session-start.mjs')],
+        {
+          input: JSON.stringify({ cwd: project, userPrompt }),
+          encoding: 'utf8',
+          timeout: 30_000,
+          env: {
+            ...process.env,
+            TOKEN_OPTIMIZER_WIKI_DIR: graphDir,
+            TOKEN_OPTIMIZER_SHARED_DIR: graphDir,
+            TOKEN_OPTIMIZER_PROJECT_REGISTRY: join(project, 'projects.jsonl'),
+            CLAUDE_PROJECT_DIR: project,
+          },
+        }
+      );
+      expect(r.status).toBe(0);
+      return (
+        JSON.parse(r.stdout || '{}')?.hookSpecificOutput?.additionalContext || ''
+      );
+    };
+
+    // Two prompts with NO overlapping terms, so each selects exactly one of the
+    // two situational findings and the wiki index genuinely differs between them.
+    const first = run('The npx jest runner ignores our settings; fix jest.');
+    const second = run('The webpack bundler emits below the wrong bundle root.');
+
+    const MARKER = '# Project wiki';
+    for (const out of [first, second]) {
+      // Stable-first is an ORDER claim, so assert the order on real output.
+      expect(out.indexOf('# Token optimization is active')).toBe(0);
+      expect(out.indexOf('# Standing rules')).toBeGreaterThan(0);
+      expect(out.indexOf(MARKER)).toBeGreaterThan(out.indexOf('# Standing rules'));
+    }
+
+    // The volatile block genuinely differs, or the prefix claim is vacuous.
+    expect(first.slice(first.indexOf(MARKER))).not.toBe(
+      second.slice(second.indexOf(MARKER))
+    );
+    expect(first).toContain('npx jest');
+    expect(first).not.toContain('webpack bundler');
+    expect(second).toContain('webpack bundler');
+    expect(second).not.toContain('npx jest');
+
+    // And everything ahead of it is the same bytes, which is what the cache
+    // charges for.
+    expect(first.slice(0, first.indexOf(MARKER))).toBe(
+      second.slice(0, second.indexOf(MARKER))
+    );
+
+    try {
+      rmSync(project, { recursive: true, force: true });
+    } catch {
+      /* windows keeps handles open briefly */
+    }
   });
 });

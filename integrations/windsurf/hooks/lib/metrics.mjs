@@ -31,6 +31,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
+import { redact } from './redact.mjs';
 
 /**
  * Read per call, not once at module load.
@@ -455,6 +456,23 @@ export function readBalance(dir) {
   return out;
 }
 
+/**
+ * True when `readEvidence` could not have read the whole log -- the file
+ * exceeds the byte cap, so anything written before the tail it kept is
+ * silently absent from what it returned. A caller that builds a per-claim
+ * record from `readEvidence` (the wiki graph's derivation record) needs this
+ * to say "operations existed but are not recorded here" rather than let an
+ * empty result read as "nothing happened".
+ */
+export function evidenceTruncated(dir) {
+  const path = evidencePath(dir);
+  try {
+    return statSync(path).size > MAX_BYTES;
+  } catch {
+    return false;
+  }
+}
+
 /** Every causal evidence record inside the byte cap, deduplicated by id. */
 export function readEvidence(dir) {
   const path = evidencePath(dir);
@@ -500,6 +518,15 @@ export function readEvidence(dir) {
 }
 
 /**
+ * The captured-output budget, in characters.
+ *
+ * Small enough that a 3 MB test log cannot bloat the evidence log or a single
+ * injected claim, large enough to hold the stack trace or compiler diagnostic
+ * that makes a failure finding worth anything.
+ */
+const OUTPUT_MAX_BYTES = 4096;
+
+/**
  * Joins a post-tool result to the most recent matching injection.  The exact
  * tool-call id wins; clients that omit it fall back to episode + surface +
  * anchor, in timestamp order, and the report states the weaker join method.
@@ -528,10 +555,47 @@ export function recordToolOutcome(dir, outcome) {
       : 'episode-anchor'
     : 'none';
 
+  // FAILURES ONLY, and that is a deliberate override of the original plan.
+  // The plan predates MCP tool names reaching this path, so it never
+  // considered that a SUCCESSFUL `smart_read` would deposit 4 KB of file
+  // content into the evidence log on every call -- the log would grow with
+  // file text and the privacy surface would be every file the session opened.
+  //
+  // Nothing downstream loses anything. A failure claim quotes the error text;
+  // a "this command works" claim needs only the fact that it worked, which
+  // `success` and `exit` already carry. So the stored text narrows to text
+  // that is already an error message.
+  //
+  // GATED ON `success === true`, not on `!== false`: an outcome that never
+  // said whether it worked is unclassified, not successful, and dropping its
+  // text would lose exactly the failures a client too terse to report status
+  // produces.
+  const captureOutput = outcome.success !== true;
+  // REDACTED AND CAPPED HERE, not at the call site. A claim built from this
+  // text is INJECTED into model context and EXPORTED to markdown, so the
+  // boundary is the only place that can guarantee it: a second caller added
+  // later would otherwise have to remember, and the one that forgot would leak
+  // a secret into two more places than the terminal it came from. `undefined`
+  // rather than `''` when nothing was captured, so JSON.stringify omits the
+  // key entirely and an absent capture is distinguishable from an empty one.
+  const output =
+    !captureOutput || outcome.output === undefined || outcome.output === null
+      ? undefined
+      : redact(String(outcome.output), { max: OUTPUT_MAX_BYTES });
+  // NULL RATHER THAN 0 when nothing is reported. Most clients supply no numeric
+  // code at all, and 0 is the success value -- defaulting to it would claim
+  // every unreported call exited cleanly, which is a fabricated observation
+  // rather than a missing one.
+  const exit = Number.isInteger(outcome.exit) ? outcome.exit : null;
+
   return record(dir, {
     kind: 'tool-outcome',
     ...outcome,
     anchor,
+    // AFTER the spread, so a caller cannot smuggle raw text past the boundary
+    // by setting the field itself.
+    output,
+    exit,
     injectionId: injection?.injectionId || null,
     findingIds: injection?.findingIds || [],
     joinMethod,
@@ -599,6 +663,89 @@ export function isFixtureAnchor(anchor) {
  * Fixture anchors are excluded from both.
  */
 /**
+ * Re-reads grouped by anchor -- the one place that decides what "wasteful" means.
+ *
+ * `rereadWaste` needed only the totals, so the grouping lived inside it and the
+ * per-anchor rows were thrown away. `derive.mjs`'s churn detector needs the
+ * rows, and re-deriving them there would put TWO definitions of "a repeat read
+ * of an unchanged file is waste" in the codebase, free to drift apart -- the
+ * exact divergence `npm run sync:hooks` exists to prevent between hooks-core and
+ * its generated copies. So the grouping lives here and both consumers read it.
+ *
+ * A re-read is only a re-read INSIDE ONE SESSION: grouping is keyed on
+ * session + canonical anchor, and rows are then merged per anchor so a file
+ * re-read across three sessions reports as one anchor with the sum of its
+ * repeats rather than three rows the caller has to add up. Merging cannot move
+ * the totals -- a sum of sums -- which is what makes it safe for `rereadWaste`.
+ *
+ * `tokens` is the WASTEFUL token count, not the total: it is the only one of the
+ * three that names something recoverable, and a row whose headline number
+ * included legitimate re-reads would overstate exactly the way the first
+ * version of this measurement did.
+ *
+ * @returns {Array<{anchor: string, repeats: number, wasteful: number,
+ *   tokens: number, legitimate: number, legitimateTokens: number,
+ *   undecidable: number, undecidableTokens: number}>} descending by `wasteful`,
+ *   then by `repeats`.
+ */
+export function rereadsByAnchor(events = [], { includeFixtures = false } = {}) {
+  const groups = new Map();
+  for (const e of events) {
+    if (!e || e.kind !== 'read' || !e.anchor) continue;
+    if (!includeFixtures && isFixtureAnchor(e.anchor)) continue;
+    const key = `${e.sessionId || ''}|${canonicalKeyish(e.anchor)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(e);
+  }
+
+  const rows = new Map();
+  for (const list of groups.values()) {
+    if (list.length < 2) continue;
+    list.sort((a, b) => (a.at || 0) - (b.at || 0));
+
+    const anchorKey = canonicalKeyish(list[0].anchor);
+    let row = rows.get(anchorKey);
+    if (!row) {
+      row = {
+        anchor: list[0].anchor,
+        repeats: 0,
+        wasteful: 0,
+        tokens: 0,
+        legitimate: 0,
+        legitimateTokens: 0,
+        undecidable: 0,
+        undecidableTokens: 0,
+      };
+      rows.set(anchorKey, row);
+    }
+
+    for (let i = 1; i < list.length; i++) {
+      const prev = list[i - 1];
+      const cur = list[i];
+      const tokens = cur.tokens || 0;
+      row.repeats += 1;
+      // THE JUDGEMENT, in one place. A repeat read of a file that CHANGED is
+      // correct behaviour, not waste; a read written before fingerprints
+      // existed cannot be judged at all and says so.
+      if (!prev.fp || !cur.fp) {
+        row.undecidable += 1;
+        row.undecidableTokens += tokens;
+      } else if (prev.fp === cur.fp) {
+        row.wasteful += 1;
+        row.tokens += tokens;
+      } else {
+        row.legitimate += 1;
+        row.legitimateTokens += tokens;
+      }
+    }
+  }
+
+  return [...rows.values()].sort(
+    (a, b) => b.wasteful - a.wasteful || b.repeats - a.repeats
+  );
+}
+
+/**
  * Re-read waste, split into what is KNOWN and what is not.
  *
  * The question is narrow on purpose: how often does one session read the same
@@ -613,6 +760,9 @@ export function isFixtureAnchor(anchor) {
  * `undecidable` is reported rather than hidden. Reads written before the
  * fingerprint existed cannot be classified, and a measurement that quietly
  * counted them either way would be inventing its own answer.
+ *
+ * The aggregate fields are UNCHANGED -- `balanceSheet` reads them -- and are now
+ * a fold over `rereadsByAnchor`'s rows. `worst` is purely additive.
  */
 export function rereadWaste(
   dir,
@@ -621,14 +771,7 @@ export function rereadWaste(
   // excludes by design, making the real path untestable.
   { events = readMetrics(dir), includeFixtures = false } = {}
 ) {
-  const groups = new Map();
-  for (const e of events) {
-    if (e.kind !== 'read' || !e.anchor) continue;
-    if (!includeFixtures && isFixtureAnchor(e.anchor)) continue;
-    const key = `${e.sessionId || ''}|${canonicalKeyish(e.anchor)}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(e);
-  }
+  const rows = rereadsByAnchor(events, { includeFixtures });
 
   const out = {
     repeats: 0,
@@ -640,29 +783,21 @@ export function rereadWaste(
     undecidableTokens: 0,
   };
 
-  for (const list of groups.values()) {
-    if (list.length < 2) continue;
-    list.sort((a, b) => (a.at || 0) - (b.at || 0));
-    for (let i = 1; i < list.length; i++) {
-      const prev = list[i - 1];
-      const cur = list[i];
-      const tokens = cur.tokens || 0;
-      out.repeats += 1;
-      if (!prev.fp || !cur.fp) {
-        out.undecidable += 1;
-        out.undecidableTokens += tokens;
-      } else if (prev.fp === cur.fp) {
-        out.wasteful += 1;
-        out.wastefulTokens += tokens;
-      } else {
-        out.legitimate += 1;
-        out.legitimateTokens += tokens;
-      }
-    }
+  for (const row of rows) {
+    out.repeats += row.repeats;
+    out.wasteful += row.wasteful;
+    out.wastefulTokens += row.tokens;
+    out.legitimate += row.legitimate;
+    out.legitimateTokens += row.legitimateTokens;
+    out.undecidable += row.undecidable;
+    out.undecidableTokens += row.undecidableTokens;
   }
 
   const decided = out.wasteful + out.legitimate;
   out.coverage = out.repeats ? decided / out.repeats : null;
+  // The offenders behind the totals, bounded: a report needs the handful worth
+  // acting on, not one row per file the session touched twice.
+  out.worst = rows.slice(0, 10);
   return out;
 }
 
@@ -725,6 +860,21 @@ export function balanceSheet(dir) {
           tokensAvoided: r.estimatedTokensAvoided,
           sufficientData: r.sufficientData,
           verdict: r.verdict,
+        };
+      })(),
+      // THE CONTROL ARM'S CONTENT, for the same reason `controlArmTokens` sits
+      // in the substitution block above: `candidateCount` and
+      // `shadowFindingIds` recorded what the holdout withheld and nothing read
+      // them, so the report could count the arms and never say what was in
+      // them.
+      ...(() => {
+        const shadow = shadowDelivery(dir);
+        return {
+          selected: shadow.selected,
+          delivered: shadow.delivered,
+          controlArmSelected: shadow.withheldSelected,
+          controlArmFindings: shadow.withheldFindings,
+          indexStaleEntries: shadow.staleEntries,
         };
       })(),
     },
@@ -1212,6 +1362,163 @@ export function indexBudget(
     floor + (ceiling - floor) * Math.min(1, hitRate * 2)
   );
   return Math.max(floor, Math.min(ceiling, scaled));
+}
+
+/**
+ * What retrieval decided NOT to inject, and why.
+ *
+ * THE OTHER HALF OF THE BUDGET, and it had no reader. `assessFindings` rejects a
+ * finding for one of three reasons -- it has been quarantined as harmful, it is
+ * in cooldown after being injected recently, or its expected value is negative
+ * -- and inject.mjs records every one of those decisions as a
+ * `retrieval-decision` event, from four separate call sites. Nothing read them.
+ *
+ * WHY THAT MATTERS RATHER THAN BEING TIDY. #204 makes the per-touch token budget
+ * load-bearing: "without it the most heavily-worked files accumulate the most
+ * findings and become the most expensive to touch, and the optimizer becomes
+ * its own token problem." A budget that silently drops what it cannot afford is
+ * indistinguishable, from outside, from a graph that had nothing to say. These
+ * are the two states a user most needs told apart, and the records to tell them
+ * apart were already being written.
+ *
+ * READ FROM THE EVIDENCE LOG, not the firehose. `retrieval-decision` is in
+ * EVIDENCE_KINDS precisely because it is rare relative to per-tool-call
+ * telemetry, and the windowed reader would evict it before it accumulated --
+ * the same eviction that made `report()` say "0 holdout" over a file containing
+ * nine.
+ */
+export function declinedAtBudget(dir, { limit = 500 } = {}) {
+  const decisions = readEvidence(dir)
+    .filter((event) => event.kind === 'retrieval-decision')
+    .slice(-limit);
+
+  const byReason = new Map();
+  const keys = new Set();
+  let declined = 0;
+  for (const decision of decisions) {
+    for (const item of decision.rejected || []) {
+      declined += 1;
+      if (item.key) keys.add(item.key);
+      // An unlabelled rejection is counted, not dropped: an unknown reason is
+      // still a finding the model did not get, and reporting the count as
+      // smaller than it is would understate exactly the cost this exists to
+      // surface.
+      const reason = item.reason || 'unspecified';
+      byReason.set(reason, (byReason.get(reason) || 0) + 1);
+    }
+  }
+
+  return {
+    decisions: decisions.length,
+    declined,
+    distinctFindings: keys.size,
+    byReason: [...byReason.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([reason, count]) => ({ reason, count })),
+  };
+}
+
+/**
+ * The injection arm's SHADOW: what retrieval selected, against what was served.
+ *
+ * THE SAME GAP `controlArmTokens` WAS CREATED TO CLOSE, one arm over. That
+ * field exists because `tokensFullFile` "was recorded and read by nothing, so
+ * the comparison the holdout exists for was not computable from the report" --
+ * and the injection side had the identical hole: every `inject` record carries
+ * `candidateCount` and `shadowFindingIds`, which are what WOULD have been
+ * delivered, non-zero in BOTH arms, while `count` and `findingIds` go to zero
+ * in the holdout. The shadow pair was written on every injection since the
+ * holdout shipped and read by nothing, so the report could say how many touches
+ * landed in each arm and never which findings the holdout actually withheld.
+ *
+ * `staleCount` is the same shape on the session-start index: `stale` (a
+ * boolean, "was any of this stale") had a reader, the count did not, so a index
+ * with one rotten entry in forty was indistinguishable from one rotten
+ * throughout.
+ *
+ * READ FROM THE BALANCE LOG, because `inject` is a BALANCE_KIND: the firehose
+ * evicts injections first -- 136 of them against 6,725 captures on one machine
+ * -- which is the eviction that made `report()` say "0 holdout" over a file
+ * containing nine.
+ */
+export function shadowDelivery(dir) {
+  const injections = readBalance(dir).filter((event) => event.kind === 'inject');
+
+  let selected = 0;
+  let delivered = 0;
+  let withheldSelected = 0;
+  const withheldKeys = new Set();
+  let staleEntries = 0;
+  let indexRecords = 0;
+
+  for (const event of injections) {
+    const candidates = Number(event.candidateCount) || 0;
+    selected += candidates;
+    delivered += Number(event.count) || 0;
+    if (event.holdout) {
+      withheldSelected += candidates;
+      for (const key of event.shadowFindingIds || []) withheldKeys.add(key);
+    }
+    if (event.surface === 'session-start') {
+      indexRecords += 1;
+      staleEntries += Number(event.staleCount) || 0;
+    }
+  }
+
+  return {
+    injections: injections.length,
+    // Everything retrieval chose, across both arms.
+    selected,
+    // What actually reached a model.
+    delivered,
+    // Chosen and deliberately not delivered, because the anchor was in the
+    // withheld arm. This is the control arm's content, which is the thing the
+    // holdout exists to make comparable.
+    withheldSelected,
+    withheldFindings: withheldKeys.size,
+    // Index staleness as a rate rather than a boolean.
+    indexRecords,
+    staleEntries,
+  };
+}
+
+/**
+ * Which MCP clients have actually handshaked with this server.
+ *
+ * `mcp-client` was written on every `initialize` and read by nothing -- a
+ * producer with no reader, and the last one the census found. Deleting it was
+ * the other option and would have been wrong: `mcp-tool` records a client only
+ * once it CALLS something, and the project registry records a name only, so a
+ * client that connected and then called nothing -- which is exactly the failure
+ * this project's doctor exists to diagnose -- appeared in neither. The
+ * handshake is the only record that a connection happened at all.
+ *
+ * `clientTitle` is the field that made the record unique and it was unread too:
+ * the display name a client reports for itself, which is how a user recognises
+ * their own editor in a list where `name` is a slug.
+ */
+export function mcpClientsSeen(dir, { limit = 200 } = {}) {
+  const seen = new Map();
+  for (const event of readEvidence(dir)) {
+    if (event.kind !== 'mcp-client') continue;
+    const name = String(event.client || 'unknown');
+    const at = Number(event.at) || 0;
+    const previous = seen.get(name);
+    // LAST HANDSHAKE WINS on the mutable fields: a client that upgraded should
+    // be reported at the version it is now, not the one it first connected on.
+    if (!previous || at >= previous.at) {
+      seen.set(name, {
+        client: name,
+        title: event.clientTitle || null,
+        version: event.clientVersion || null,
+        at,
+        connections: (previous?.connections || 0) + 1,
+      });
+    } else {
+      previous.connections += 1;
+    }
+  }
+  return [...seen.values()].sort((a, b) => b.at - a.at).slice(0, limit);
 }
 
 /* ----------------------------------------------------------------------

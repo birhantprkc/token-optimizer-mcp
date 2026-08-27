@@ -24,7 +24,22 @@ import { existsSync, statSync, readFileSync, writeFileSync, unlinkSync, mkdirSyn
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { harvestMode } from './harvest.mjs';
-import { readManifest, verifyManifest, residue } from './manifest.mjs';
+import { readManifest, verifyManifest, residue, manifestSize } from './manifest.mjs';
+import { mcpClientsSeen } from './metrics.mjs';
+
+/**
+ * Bytes as a person reads them.
+ *
+ * Local because it exists for one line of one check, and because the alternative
+ * -- printing a raw byte count next to a file count -- is the kind of detail
+ * that gets skimmed past rather than read.
+ */
+function describeBytes(bytes) {
+  if (!bytes) return 'size unknown';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 const ok = (name, detail) => ({ name, pass: true, detail });
 const bad = (name, detail, remedy) => ({ name, pass: false, detail, remedy });
@@ -180,7 +195,8 @@ function hooksDirFor({ hooksDir, install, root }) {
  * identical from outside: a graph that fills with structural nodes either way.
  *
  * Measured on a real 5.4.0 install: 484 symbol, 286 file and 122 task nodes and
- * ZERO findings, because harvestMode() was 'off:not-opted-in'. Fifteen checks
+ * ZERO findings, because harvestMode() then returned an opt-in refusal (the mode has
+ * since been renamed: it is 'off:no-key' now, and opting in is no longer the gate). Fifteen checks
  * passed and none mentioned harvest. stop-harvest.mjs names this exact gap --
  * "nothing in doctor, audit or waste mentions harvest, so a user sees a graph
  * filling with structural nodes and no findings and has no way to learn why" --
@@ -204,9 +220,15 @@ export function probeHarvest() {
   // optimizer is off" is noise, which is why stop-harvest maps it to no notice.
   if (mode === 'off:mode') return [];
 
+  // SAID PLAINLY, because this is the configuration a user would choose if they
+  // knew it existed and the previous wording buried it in machinery. A local
+  // endpoint is the only setting under which the semantic harvest runs with no
+  // credential, no billing and no digest leaving the machine -- so the two facts
+  // that decide whether someone wants it are the two facts stated first.
   if (mode === 'local') {
     return [ok('finding extraction is available',
-      'active-model wiki_write is primary; local endpoint also enables fallback extraction')];
+      'local model found -- semantic harvest is on, free and private: no credential, no billing, ' +
+      'and nothing leaves this machine. Active-model wiki_write remains the primary path')];
   }
   if (mode === 'remote') {
     return [ok('finding extraction is available',
@@ -216,10 +238,19 @@ export function probeHarvest() {
 
   // No second-model credential is required for the primary path. The Codex/agent session that
   // already paid to derive the conclusion is the extractor and wiki_write is local.
+  // NAME THE TRADE, not just the missing variable. This is the default state on
+  // every machine without a credential, so it is the text most users will read,
+  // and "unavailable" alone tells them neither what they are missing nor that
+  // the free option exists. Local findings still accumulate: derive.mjs reads
+  // exit codes, red-to-green transitions, corrections and churn out of evidence
+  // already on disk and sends nothing anywhere.
   if (mode === 'off:no-key') {
     return [ok('finding extraction is available',
-      'active model records durable conclusions through local wiki_write; no separate-model ' +
-      'credential is configured, so fallback transcript extraction is unavailable')];
+      'active model records durable conclusions through local wiki_write, and derive runs at ' +
+      'session end with no credential. No separate-model credential is configured, so fallback ' +
+      'transcript extraction is unavailable: point TOKEN_OPTIMIZER_HARVEST_ENDPOINT at a local ' +
+      'model to run it free and private, or set TOKEN_OPTIMIZER_API_KEY to run it from a bounded ' +
+      'digest of paths, commands, prompts and conclusions -- never file contents')];
   }
 
   // off:opted-out -- a deliberate choice, reported as one. Nagging about a setting somebody chose
@@ -360,12 +391,32 @@ export function checklist({ root, settingsPath, install }) {
     }
 
     // What we recorded putting on the machine, and whether it is still that.
-    const verified = verifyManifest(readManifest());
+    const manifest = readManifest();
+    const verified = verifyManifest(manifest);
     if (verified) {
-      checks.push(verified.modified === 0
-        ? ok('installed files intact', `${verified.intact} file(s) match the install manifest`)
-        : ok('installed files intact', `${verified.modified} file(s) edited since install -- ` +
+      // HOW MUCH, not just how many. manifestSize computed exactly this and had
+      // no caller, so the one number that says what uninstall will actually
+      // remove -- and the only cross-check on a manifest that lists files which
+      // no longer exist, since a missing file contributes zero bytes -- was
+      // computed nowhere and shown to no one.
+      const footprint = describeBytes(manifestSize(manifest));
+      // MISSING IS NOT INTACT, and branching on `modified` alone said it was.
+      // verifyManifest reports three states and this read two of them: a
+      // recorded file DELETED rather than edited left `modified === 0`, so a
+      // half-removed install passed as healthy. The footprint above is what
+      // makes it visible -- a missing file contributes zero bytes -- but a
+      // visible detail beside a PASS is still a PASS.
+      if (verified.missing > 0) {
+        checks.push(bad('installed files intact',
+          `${verified.missing} of ${verified.files.length} recorded file(s) are gone (${footprint} still on disk)`,
+          'reinstall the package to restore them, or run the uninstaller to clear the manifest'));
+      } else if (verified.modified === 0) {
+        checks.push(ok('installed files intact', `${verified.intact} file(s), ${footprint}, match the install manifest`));
+      } else {
+        checks.push(ok('installed files intact', `${verified.modified} of ${verified.intact + verified.modified} file(s) ` +
+          `(${footprint} recorded) edited since install -- ` +
           'uninstall will leave those alone rather than destroy your changes'));
+      }
     } else {
       checks.push(bad('install manifest present', 'no record of what was installed',
         'harmless if you installed manually; reinstall to get a removable, verifiable record'));
@@ -513,9 +564,16 @@ export function probeGraph({ dir }) {
   // the bits read back as world-readable regardless, so failing there would be
   // reporting a platform property as a broken install: a false alarm that
   // teaches people to ignore the doctor.
+  // BEFORE THE PLATFORM RETURN, and this is exactly the defect this branch
+  // exists to close: the client probe was appended after `probeGraph`'s
+  // Windows early-return, so on Windows it had a call site and never ran. A
+  // reference that cannot execute is what the reachability guard cannot see.
+  const clients = probeClients({ dir });
+
   if (process.platform === 'win32') {
     checks.push(ok('graph directory is private',
       'POSIX modes are not enforced on Windows; the directory inherits its parent ACL'));
+    checks.push(...clients);
     return checks;
   }
 
@@ -529,7 +587,39 @@ export function probeGraph({ dir }) {
     checks.push(ok('graph directory is private', 'mode could not be read on this filesystem'));
   }
 
+  checks.push(...clients);
   return checks;
+}
+
+/**
+ * Which MCP clients have actually handshaked with this server.
+ *
+ * THE QUESTION THE REST OF THE DOCTOR CANNOT ANSWER. Every other check here
+ * reasons about files on disk: is the hook present, is it wired, does it refuse
+ * a large read. None of them can tell you whether the editor in front of you
+ * ever actually connected -- which is the single most common way this product
+ * is installed and silently does nothing.
+ *
+ * `mcp-client` records exactly that on every `initialize`, and nothing read it
+ * until now. NEVER A FAILURE: a fresh install has no handshakes yet, and a
+ * doctor that reports red on a correct install teaches people to ignore it.
+ */
+export function probeClients({ dir }) {
+  let clients = [];
+  try {
+    clients = mcpClientsSeen(dir);
+  } catch {
+    return [ok('MCP clients seen', 'no evidence log yet')];
+  }
+  if (!clients.length) {
+    return [ok('MCP clients seen', 'none yet -- the server has had no MCP handshake in this project')];
+  }
+  const described = clients
+    .slice(0, 5)
+    .map((c) => `${c.title || c.client}${c.version ? ` ${c.version}` : ''}`)
+    .join(', ');
+  return [ok('MCP clients seen', `${clients.length}: ${described}` +
+    (clients.length > 5 ? `, and ${clients.length - 5} more` : ''))];
 }
 
 /**

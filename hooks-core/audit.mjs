@@ -28,9 +28,13 @@
  * cost at the bottom.
  */
 
-import { record, readMetrics } from './metrics.mjs';
+import { record, readMetrics, declinedAtBudget } from './metrics.mjs';
+import { referenceNote } from './usage.mjs';
+import { looNote } from './loo.mjs';
+import { calibrationNote } from './crosslayer.mjs';
 import { remedyLedger, applyRemedy, proposal } from './remedy.mjs';
 import { money, monthly, priceNote, dollars } from './pricing.mjs';
+import { renderStanding } from './standing.mjs';
 
 const estimate = (text) => Math.ceil(String(text || '').length / 4);
 
@@ -53,6 +57,28 @@ export function declines(dir, { events = readMetrics(dir) } = {}) {
     counts.set(event.id, (counts.get(event.id) || 0) + 1);
   }
   return counts;
+}
+
+/**
+ * What the local Stop-time derivation path produced in the visible event log.
+ *
+ * The producer records all three counts because any one of them alone is
+ * ambiguous: zero stored can mean no evidence, no candidates, or a binding
+ * storage/anchor filter. This reader keeps those states distinct and prevents
+ * the telemetry itself from becoming an unobserved cost.
+ */
+export function derivationNote(dir, { events = readMetrics(dir) } = {}) {
+  const runs = events.filter((event) => event.kind === 'derive');
+  if (!runs.length) return null;
+
+  const sum = (field) =>
+    runs.reduce((total, event) => total + Math.max(0, Number(event[field]) || 0), 0);
+  const candidates = sum('candidates');
+  const observations = sum('observations');
+  const written = sum('written');
+  return `Local derivation: ${candidates.toLocaleString()} candidate(s) from ` +
+    `${observations.toLocaleString()} observation(s); ${written.toLocaleString()} stored ` +
+    `across ${runs.length.toLocaleString()} Stop run(s).`;
 }
 
 const idOf = (finding) =>
@@ -181,7 +207,7 @@ export function buildQueue(
 export function renderAudit(
   dir,
   findings = [],
-  { tier = 'opus', full = false, sessionsPerMonth = 60 } = {}
+  { tier = 'opus', full = false, sessionsPerMonth = 60, standing = null } = {}
 ) {
   const { queue, suppressed, done } = buildQueue(dir, findings);
   const lines = [];
@@ -239,9 +265,15 @@ export function renderAudit(
     lines.push(text);
   }
 
+  // SCOPED TO THE QUEUE, because that is all it ever described. The bare
+  // sentence "Nothing addressable found." was printed directly above a Layer 1
+  // reference note and a published Layer 2 causal verdict -- so a reader was
+  // told nothing had been found immediately before being shown a finding. The
+  // headline is about the remediation queue and nothing else, and saying so
+  // costs four words and removes a false negative shown to a human.
   const head = shown.length
     ? ['What to do next, most expensive first:', ...lines]
-    : ['Nothing addressable found.'];
+    : ['Nothing addressable found in the remediation queue.'];
 
   const body = [...head];
 
@@ -317,6 +349,115 @@ export function renderAudit(
       );
     }
   }
+
+  // WHAT THE BUDGET TURNED AWAY.
+  //
+  // The per-touch token budget is load-bearing by design (#204): without it the
+  // most heavily-worked files accumulate the most findings and become the most
+  // expensive to touch. But a budget that silently drops what it cannot afford
+  // looks, from outside, exactly like a graph that had nothing to say -- and
+  // those are the two states a reader most needs told apart. inject.mjs was
+  // already recording every rejection and its reason, from four call sites, and
+  // nothing read them.
+  //
+  // ONE LINE, not a panel. This is context for the queue above rather than
+  // another thing to do, and the report is held to its own cost.
+  try {
+    const declined = declinedAtBudget(dir);
+    if (declined.declined > 0) {
+      const reasons = declined.byReason
+        .slice(0, 3)
+        .map(({ reason, count }) => `${reason} ${count}`)
+        .join(', ');
+      body.push(
+        '',
+        `Retrieval declined ${declined.declined.toLocaleString()} finding(s) ` +
+          `(${declined.distinctFindings} distinct) across ${declined.decisions.toLocaleString()} decision(s): ${reasons}.`
+      );
+    }
+  } catch {
+    /* the rejection log is context, never a reason to fail the audit */
+  }
+
+  // STANDING CONTEXT, as a panel rather than only as queue rows.
+  //
+  // auditStanding and verdictFor were both reachable, so this project already
+  // computed which CLAUDE.md rules and skills are stale, oversized or never
+  // used -- and threw the report away. renderStanding existed, was tested, and
+  // had no caller: the forTouch shape exactly, in the subsystem #203 claimed
+  // closed the skills-and-memory gap. Hard to defend a gap as closed while the
+  // report that would show it is unreachable.
+  //
+  // WHAT THE QUEUE ABOVE CANNOT SAY, which is why this is not duplication. The
+  // queue carries one row per ACTION, so a standing file with nothing wrong
+  // contributes no row and is invisible -- and the total cost of the prefix,
+  // the number that says what standing context is worth arguing about at all,
+  // is carried by no row either. Both are in the panel.
+  //
+  // Costed like everything else here: it is pushed BEFORE the closing line is
+  // measured, so the report's self-cost includes its own newest panel rather
+  // than understating it.
+  if (standing?.length) {
+    body.push('', 'Standing context -- charged every session:', '');
+    const panel = renderStanding(standing, { sessionsPerMonth });
+    // Indented to sit under its heading, blank lines left blank rather than
+    // turned into trailing whitespace.
+    for (const line of panel.split('\n')) body.push(line ? `  ${line}` : '');
+    // ONLY IF THEY ACTUALLY DID. This pointed the reader at "the queue at the
+    // top" whenever any verdict carried an action -- including when the queue
+    // printed "Nothing addressable found", because a caller can render the
+    // panel with no findings at all, and the withholding rule can drop a
+    // standing row even when findings were passed. Telling someone to look at
+    // a row that is not there is worse than saying nothing.
+    const shownStandingIds = new Set(
+      shown.map((item) => item.id).filter((id) => typeof id === 'string' && id.startsWith('standing-'))
+    );
+    if (shownStandingIds.size) {
+      body.push(
+        '',
+        '  The actions above also appear in the queue at the top, where they are priced and applyable.'
+      );
+    }
+  }
+
+  // WHAT THE DEFAULT, LOCAL DERIVATION PATH ACTUALLY PRODUCED.
+  //
+  // This event used to have a producer and no reader. Keep its three states
+  // together: evidence seen, candidates derived, and findings that survived
+  // selection/storage. A lone stored count would turn every earlier refusal
+  // into an apparent "nothing found" result.
+  const derived = derivationNote(dir);
+  if (derived) body.push('', derived);
+
+  // WHETHER THE FINDINGS WE INJECTED GOT USED (Layer 1).
+  //
+  // Printed here because this is the report that already asks "did the advice
+  // change anything", and because a measurement with no reader is how this
+  // project shipped two metrics whose only consumer was their own test suite.
+  // `referenceNote` returns null when it has nothing honest to say, so a
+  // project with no injections and no queries gains no line at all.
+  const reference = referenceNote(dir);
+  if (reference) body.push('', reference);
+
+  // WHAT ONE FINDING IS CAUSALLY WORTH (Layer 2).
+  //
+  // The same reasoning as above, and the same refusal: `looNote` returns null
+  // until the leave-one-out experiment has collected an observation, and says
+  // NOT MEASURABLE YET rather than printing a mean until it clears the floor.
+  // A causal number is the most quotable thing this project can produce, so it
+  // is the one that most needs to be absent when it is not earned.
+  const causal = looNote(dir);
+  if (causal) body.push('', causal);
+
+  // WHETHER LAYER 1'S CHEAP LABEL PREDICTS LAYER 2'S EXPENSIVE EFFECT.
+  //
+  // The reason this is printed rather than kept for a dashboard: the reference
+  // rate is the number a reader is most likely to quote as a saving, and it is
+  // not one until this comparison says so. `calibrationNote` returns null while
+  // both layers are silent, and otherwise prints the refusal -- naming which
+  // input was insufficient -- rather than a gap of zero.
+  const calibrated = calibrationNote(dir);
+  if (calibrated) body.push('', calibrated);
 
   const addressable = queue.reduce(
     (sum, item) => sum + (item.costPerSession || 0),
