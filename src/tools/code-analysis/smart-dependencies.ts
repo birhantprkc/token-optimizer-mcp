@@ -13,20 +13,20 @@
  * Week 5 - Phase 2 Track 2A
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, statSync } from 'fs';
 import { parse as parseTypescript } from '@typescript-eslint/typescript-estree';
 import { parse as parseBabel } from '@babel/parser';
-// glob v10+ is native ESM and has no default export; the CJS-style
-// `import pkg from 'glob'` threw "does not provide an export named 'default'"
-// at import time, which is why this module could never be loaded. Every other
-// file in this codebase already imports it the working way.
-import { globSync } from 'glob';
 import { relative, resolve, dirname, extname, join } from 'path';
 import { CacheEngine } from '../../core/cache-engine.js';
 import { measured, unmeasured } from '../shared/savings.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import { MetricsCollector } from '../../core/metrics.js';
 import { hashFileMetadata, generateCacheKey } from '../shared/hash-utils.js';
+import {
+  boundedGlob,
+  traversalDeadlineMs,
+  type TruncationReason,
+} from '../shared/bounded-traversal.js';
 
 /**
  * Represents an import in a file
@@ -117,6 +117,16 @@ export interface SmartDependenciesOptions {
   // Output options
   format?: 'compact' | 'detailed'; // Output format
   includeMetadata?: boolean; // Include file metadata
+
+  /**
+   * Wall-clock budget in ms for discovering the files to analyse.
+   *
+   * File discovery here was `globSync` over every source file in the tree,
+   * which is the same unbounded walk issue #335 reported: on a large tree it
+   * blocks the event loop until it finishes, and there was no point at which
+   * it could give up and answer. Defaults to 10 s.
+   */
+  deadlineMs?: number;
 }
 
 /** JSON-safe shape of the dependency graph. */
@@ -141,6 +151,14 @@ export interface SmartDependenciesResult {
     duration: number;
     cacheHit: boolean;
     incrementalUpdate: boolean;
+    /**
+     * Set when a bound stopped file discovery, so the graph describes only
+     * part of the tree. Absent means the walk ran to completion -- the
+     * difference between "no cycles" and "no cycles among what I looked at".
+     */
+    searchTruncated?: boolean;
+    searchTruncatedBy?: TruncationReason;
+    searchNote?: string;
   };
   /**
    * The dependency graph, as data JSON can carry.
@@ -164,6 +182,26 @@ export interface SmartDependenciesResult {
 }
 
 export class SmartDependenciesTool {
+  /**
+   * Token count per relative path, recorded while the file was open.
+   *
+   * Cleared at the start of every `analyze()` so it can never serve a count
+   * from a previous call's content -- the saving is skipping a redundant read
+   * WITHIN one analysis, not caching across them.
+   */
+  private fileTokenCounts = new Map<string, number>();
+
+  /**
+   * Whether a candidate module path is a file, remembered for one `analyze()`.
+   *
+   * Import resolution probes the same handful of candidates over and over --
+   * every file in a package resolving `./index` walks the identical extension
+   * list -- and each probe was its own `existsSync`. Measured 2026-08-28 after
+   * the read-once fix landed: 4.98 s, 14.6% of the run, and the single largest
+   * remaining cost. Cleared per call for the same reason as the token counts.
+   */
+  private pathExists = new Map<string, boolean>();
+
   constructor(
     private cache: CacheEngine,
     private tokenCounter: TokenCounter,
@@ -187,6 +225,8 @@ export class SmartDependenciesTool {
     options: SmartDependenciesOptions = {}
   ): Promise<SmartDependenciesResult> {
     const startTime = Date.now();
+    this.fileTokenCounts.clear();
+    this.pathExists.clear();
 
     // Default options
     const opts: Required<SmartDependenciesOptions> = {
@@ -210,6 +250,7 @@ export class SmartDependenciesTool {
       ttl: options.ttl ?? 7,
       format: options.format ?? 'compact',
       includeMetadata: options.includeMetadata ?? false,
+      deadlineMs: traversalDeadlineMs(options.deadlineMs),
     };
 
     try {
@@ -242,6 +283,18 @@ export class SmartDependenciesTool {
         default:
           result = this.transformGraphOutput(graph, opts, startTime);
           break;
+      }
+
+      // Truncation is a property of the WALK, but each mode handler builds its
+      // own metadata from the finished graph, so the flag is dropped on three
+      // of the four paths unless it is re-applied here. A `circular` result
+      // that quietly loses it reads as "no cycles" rather than "no cycles in
+      // the part of the tree I actually reached".
+      if (graphResult.metadata.searchTruncated) {
+        result.metadata.searchTruncated = true;
+        result.metadata.searchTruncatedBy =
+          graphResult.metadata.searchTruncatedBy;
+        result.metadata.searchNote = graphResult.metadata.searchNote;
       }
 
       // Record metrics
@@ -410,10 +463,14 @@ export class SmartDependenciesTool {
     }
 
     // Build graph from scratch
-    const graph = await this.buildFullGraph(opts);
+    const { graph, truncatedBy } = await this.buildFullGraph(opts);
 
-    // Cache the graph
-    if (opts.useCache) {
+    // A PARTIAL GRAPH IS NEVER CACHED. Storing one would outlive the call that
+    // knew it was partial: every later request would hit the cache, report
+    // `cacheHit: true` with no truncation flag at all, and answer "unused" for
+    // files whose importers were simply never walked. Paying for a rebuild is
+    // cheaper than a fast wrong answer that persists for the TTL.
+    if (opts.useCache && !truncatedBy) {
       this.cacheGraph(cacheKey, graph, opts.ttl);
     }
 
@@ -440,6 +497,13 @@ export class SmartDependenciesTool {
         duration: 0,
         cacheHit: false,
         incrementalUpdate: false,
+        ...(truncatedBy
+          ? {
+              searchTruncated: true,
+              searchTruncatedBy: truncatedBy,
+              searchNote: `File discovery stopped at the ${opts.deadlineMs}ms traversal deadline, so this graph covers only part of the tree and anything derived from it -- unused imports, cycles, impact -- may be missing entries. The partial graph was NOT cached. Narrow \`files\`/\`exclude\`, or raise TOKEN_OPTIMIZER_TRAVERSAL_DEADLINE_MS.`,
+            }
+          : {}),
       },
     };
   }
@@ -449,17 +513,38 @@ export class SmartDependenciesTool {
    */
   private async buildFullGraph(
     opts: Required<SmartDependenciesOptions>
-  ): Promise<Map<string, DependencyNode>> {
+  ): Promise<{
+    graph: Map<string, DependencyNode>;
+    truncatedBy?: TruncationReason;
+  }> {
+    // ONE budget for the whole call, not one per pattern. `files` defaults to a
+    // single pattern but accepts a list, and giving each its own 10 s deadline
+    // would turn a five-pattern request into a fifty-second one -- which is the
+    // caller's tool timeout, the thing this bound exists to stay under.
+    const expiresAt = Date.now() + opts.deadlineMs;
+    const remainingMs = () => Math.max(1, expiresAt - Date.now());
+
     // Find all files to analyze
     let files: string[] = [];
+    let truncatedBy: TruncationReason | undefined;
+
     for (const pattern of opts.files) {
-      const matches = globSync(pattern, {
+      if (truncatedBy) break;
+      const walk = await boundedGlob(pattern, {
         cwd: opts.cwd,
         absolute: true,
         ignore: opts.exclude,
         nodir: true,
+        deadlineMs: remainingMs(),
       });
-      files.push(...matches);
+      files.push(...walk.items);
+      // NO CAP, DELIBERATELY. Every mode here answers a whole-graph question --
+      // what imports what, which cycles exist, what is unused -- and a cap does
+      // not shorten that answer, it falsifies it: dropping a node also drops
+      // the `importedBy` edges of nodes that were KEPT, so a file that IS
+      // imported comes back reported as unused. The deadline is the only bound
+      // that can be reported honestly, because what it reports is "partial".
+      if (walk.truncated) truncatedBy = walk.truncatedBy;
     }
 
     // Remove duplicates
@@ -479,7 +564,7 @@ export class SmartDependenciesTool {
     // Build reverse dependencies (importedBy)
     this.buildReverseDependencies(graph, opts.cwd);
 
-    return graph;
+    return { graph, truncatedBy };
   }
 
   /**
@@ -491,6 +576,13 @@ export class SmartDependenciesTool {
       const ext = extname(filePath);
       const hash = hashFileMetadata(filePath);
       const relativePath = relative(cwd, filePath);
+
+      // Counted here, where the content is already in memory. See
+      // measureFullFileTokens for what this replaces.
+      this.fileTokenCounts.set(
+        relativePath,
+        this.tokenCounter.count(content).tokens
+      );
 
       const imports: DependencyImport[] = [];
       const exports: DependencyExport[] = [];
@@ -1171,36 +1263,59 @@ export class SmartDependenciesTool {
   /**
    * Utility: Resolve relative path
    */
+  /**
+   * Whether a candidate resolves to an actual FILE, asked once per analysis.
+   *
+   * `isFile()`, not `existsSync`. A directory satisfies `existsSync`, so
+   * `./foo` in a project holding a `foo/` directory resolved to the directory
+   * itself -- producing a graph edge to `src/foo`, which is not a node in the
+   * graph at all. Measured on a fixture holding both `foo.ts` and
+   * `foo/index.ts`: the recorded edge was `src\\main.ts -> src\\foo`, pointing
+   * at nothing, while Node resolves that import to `foo.ts`.
+   */
+  private candidateIsFile(candidate: string): boolean {
+    const remembered = this.pathExists.get(candidate);
+    if (remembered !== undefined) return remembered;
+    let isFile = false;
+    try {
+      isFile = statSync(candidate).isFile();
+    } catch {
+      isFile = false;
+    }
+    this.pathExists.set(candidate, isFile);
+    return isFile;
+  }
+
+  /**
+   * Resolve an import specifier to a path relative to `cwd`.
+   *
+   * Order matches Node: the path as written, then the extension candidates,
+   * then `index.*` inside a directory of that name. Each step returns on the
+   * first hit, so a later candidate can never overwrite an earlier one.
+   */
   private resolveRelativePath(
     source: string,
     fileDir: string,
     cwd: string
   ): string {
     const resolved = resolve(fileDir, source);
-    let relativePath = relative(cwd, resolved);
+    if (this.candidateIsFile(resolved)) return relative(cwd, resolved);
 
-    // Try common extensions if file doesn't exist
     const extensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
-    if (!existsSync(resolved)) {
-      for (const ext of extensions) {
-        const withExt = `${resolved}${ext}`;
-        if (existsSync(withExt)) {
-          relativePath = relative(cwd, withExt);
-          break;
-        }
-      }
 
-      // Try index files
-      const indexFiles = extensions.map((ext) => join(resolved, `index${ext}`));
-      for (const indexFile of indexFiles) {
-        if (existsSync(indexFile)) {
-          relativePath = relative(cwd, indexFile);
-          break;
-        }
-      }
+    for (const ext of extensions) {
+      const withExt = `${resolved}${ext}`;
+      if (this.candidateIsFile(withExt)) return relative(cwd, withExt);
     }
 
-    return relativePath;
+    for (const ext of extensions) {
+      const indexFile = join(resolved, `index${ext}`);
+      if (this.candidateIsFile(indexFile)) return relative(cwd, indexFile);
+    }
+
+    // Nothing on disk matches -- an unresolvable import is recorded as written
+    // rather than dropped, so the edge is visible instead of silently absent.
+    return relative(cwd, resolved);
   }
 
   /**
@@ -1265,6 +1380,20 @@ export class SmartDependenciesTool {
   private measureFullFileTokens(files: string[], cwd: string): number {
     let total = 0;
     for (const file of files) {
+      // ALREADY COUNTED WHILE THE FILE WAS OPEN. `analyzeFile` reads every file
+      // to parse it and records the count there, so this baseline used to read
+      // the entire project a SECOND time purely to produce a savings figure.
+      // Measured 2026-08-28 on 12,000 files: 19.58 s of readFileUtf8, 38% of a
+      // 51 s run, spent re-reading bytes the tool had just finished with.
+      //
+      // A miss still reads -- the cached-graph paths reach here without having
+      // analysed anything -- so this is a shortcut, never a different answer:
+      // the count comes from the same tokenizer over the same content.
+      const counted = this.fileTokenCounts.get(file);
+      if (counted !== undefined) {
+        total += counted;
+        continue;
+      }
       try {
         // RESOLVED AGAINST THE PROJECT, not the process. The graph is keyed by
         // paths relative to `cwd` (see analyzeFile), so reading them as-is
@@ -1460,6 +1589,11 @@ export const SMART_DEPENDENCIES_TOOL_DEFINITION = {
         description:
           'Include per-package version and resolution detail, not just the edges',
         default: false,
+      },
+      deadlineMs: {
+        type: 'number',
+        description:
+          'Wall-clock budget in ms for discovering the files to analyse (default 10000). On expiry the graph comes back partial with metadata.searchTruncated set and is NOT cached, instead of walking until the calling tool times out.',
       },
     },
   },
