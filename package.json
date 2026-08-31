@@ -54,8 +54,8 @@
     "dashboard": "node dist/server/web-server.js",
     "dashboard:dev": "tsc -p tsconfig.dashboard.json && npm run copy:assets && node dist/server/web-server.js",
     "dashboard:build": "tsc -p tsconfig.dashboard.json && npm run copy:assets",
-    "lint": "eslint src --ext .ts,.js",
-    "lint:fix": "eslint src --ext .ts,.js --fix",
+    "lint": "eslint src tests --ext .ts,.js,.mjs,.mts",
+    "lint:fix": "eslint src tests --ext .ts,.js,.mjs,.mts --fix",
     "format": "prettier --write 'src/**/*.{ts,js,json}'",
     "format:check": "prettier --check 'src/**/*.{ts,js,json}'",
     "validate": "node scripts/validate-package.js",
@@ -107,7 +107,12 @@
     "dashboard:verify-live": "node scripts/verify-live-dashboard.mjs",
     "dashboard:attribution-smoke": "node scripts/run-dashboard-attribution-smoke.mjs",
     "dashboard:audit-savings": "node scripts/audit-token-savings.mjs",
-    "explore:wiki": "node scripts/explore-wiki.mjs"
+    "explore:wiki": "node scripts/explore-wiki.mjs",
+    "bench:build": "npm run bench:pack && docker build -f bench/thol/Dockerfile -t thol-rig:local bench/",
+    "bench:screen": "bash bench/thol/run-campaign.sh",
+    "bench:confirm": "REPS=3 bash bench/thol/run-campaign.sh",
+    "bench:debug-loop": "node bench/debug-loop/run.mjs",
+    "bench:pack": "node scripts/bench-pack.mjs"
   },
   "repository": {
     "type": "git",

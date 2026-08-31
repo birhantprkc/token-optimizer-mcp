@@ -149,21 +149,21 @@ describe('our config entries are found by what they run, not where they sit', ()
 });
 
 describe('the doctor runs the thing rather than inspecting it', () => {
-  test('a large read is actually refused by the real hook binary', () => {
+  test('a large read is actually refused by the real hook binary', async () => {
     // The check a checklist cannot make. This project shipped a version where
     // every configuration check passed and the hook saved nothing.
-    const checks = probeEnforcement({ root: ROOT, workspace });
+    const checks = await probeEnforcement({ root: ROOT, workspace });
     const refusal = checks.find((c) => c.name === 'enforcement refuses a large read');
     expect(refusal.pass).toBe(true);
   }, 30_000);
 
-  test('a small read is left alone, because refusing everything is also broken', () => {
-    const checks = probeEnforcement({ root: ROOT, workspace });
+  test('a small read is left alone, because refusing everything is also broken', async () => {
+    const checks = await probeEnforcement({ root: ROOT, workspace });
     expect(checks.find((c) => c.name === 'small reads are left alone').pass).toBe(true);
   }, 30_000);
 
-  test('the session-start hook really emits the policy', () => {
-    const checks = probeSessionStart({ root: ROOT, workspace });
+  test('the session-start hook really emits the policy', async () => {
+    const checks = await probeSessionStart({ root: ROOT, workspace });
     expect(checks[0].pass).toBe(true);
     expect(checks[0].detail).toMatch(/tokens of standing context/);
   }, 30_000);
@@ -173,15 +173,35 @@ describe('the doctor runs the thing rather than inspecting it', () => {
     expect(checks.every((c) => c.pass)).toBe(true);
   });
 
-  test('a missing hook binary fails with a remedy rather than an exception', () => {
-    const checks = probeEnforcement({ root: join(workspace, 'nowhere'), workspace });
+  test('a missing hook binary fails with a remedy rather than an exception', async () => {
+    const checks = await probeEnforcement({ root: join(workspace, 'nowhere'), workspace });
     expect(checks[0].pass).toBe(false);
     expect(checks[0].remedy).toBeTruthy();
   });
 
   test('every failing check names a fix, because a diagnosis without one is a complaint', () => {
-    const checks = checklist({ root: join(workspace, 'nowhere'), settingsPath: join(workspace, 'nope.json') });
-    for (const check of checks.filter((c) => !c.pass)) expect(check.remedy).toBeTruthy();
+    const checks = checklist({
+      root: join(workspace, 'nowhere'),
+      settingsPath: join(workspace, 'nope.json'),
+      // `install` is passed EXPLICITLY, and that is the point of this test.
+      // Without it, checklist() falls through to detectInstall(), which reads
+      // the MACHINE's ~/.claude/plugins record -- valid on any developer box --
+      // so a deliberately absent `root` still resolved to a real hooks
+      // directory, every check passed, and the loop below ran zero times while
+      // reporting success. Naming an absent hooks directory is what actually
+      // produces the failing checks this test is about.
+      install: {
+        method: 'script',
+        hooksDir: join(workspace, 'nowhere', 'plugin', 'hooks'),
+      },
+    });
+    const failing = checks.filter((c) => !c.pass);
+    // Asserted before the loop, because a loop over an empty array asserts
+    // nothing and reports success. A missing root and a missing settings file
+    // MUST fail checks; if they stop doing so this test has to say so rather
+    // than quietly become a no-op.
+    expect(failing.length).toBeGreaterThan(0);
+    for (const check of failing) expect(String(check.remedy ?? '')).toMatch(/\S/);
   });
 
   test('the rendered report states the off switch', async () => {
