@@ -47,6 +47,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { isFsSafePath } from './paths.mjs';
+// The advisory's own per-session cap, imported rather than duplicated so the
+// merge below cannot drift from the producer that applies it.
+import { SESSION_CAP as ADVISED_CAP } from './advise.mjs';
 import { noteHookOutput } from './observability.mjs';
 
 /** Enforcement modes, least to most permissive. */
@@ -315,6 +318,13 @@ function emptyState() {
     editedFiles: [],
     harvestedEdits: 0,
     recordingNudged: false,
+    // Facts the search advisory has already delivered this session. Without
+    // this in the default, loadState returned an object with no `advised`, the
+    // router rebuilt an empty Set on every hook process, and the same advisory
+    // was re-emitted for every search -- the one behaviour its own comment
+    // says is worse than staying silent, because a block the model has learned
+    // to skip costs tokens and buys nothing.
+    advised: [],
     optimizerTools: [],
     optimizerToolsObservedAt: 0,
   };
@@ -389,6 +399,9 @@ export function loadState(sessionId, agent) {
         ? parsed.harvestedEdits
         : 0,
       recordingNudged: parsed.recordingNudged === true,
+      advised: Array.isArray(parsed.advised)
+        ? parsed.advised.filter((f) => typeof f === 'string')
+        : [],
       // Runtime MCP registration is session evidence, not an install-time
       // assumption. Keep the exact inventory from SessionStart so later hook
       // processes can avoid redirecting to schemas the host did not expose.
@@ -494,6 +507,27 @@ export function saveState(sessionId, state, agent) {
       recordingNudged: Boolean(
         current.recordingNudged || state.recordingNudged
       ),
+      // UNION, AND CAPPED. Two hook processes can each deliver an advisory
+      // before either writes, so last-writer-wins would forget one and repeat
+      // it. A fact once told stays told -- that is the whole point of the set
+      // -- so the merge is a union, bounded by the same SESSION_CAP the router
+      // applies so a long session cannot grow this without limit.
+      // BOUNDED OVERSHOOT UNDER CONCURRENCY, ACCEPTED DELIBERATELY. Two hook
+      // processes can each read a set of size CAP-1, each emit an advisory,
+      // and only then reach this merge -- so slightly more advice can reach
+      // the model than the cap nominally allows. Preventing that requires
+      // claiming capacity BEFORE emitting, which means taking the state lock
+      // on every Grep and Glob in the PreToolUse hot path.
+      //
+      // Not worth it. The overshoot is bounded by the number of concurrent
+      // hook processes, each advisory is under 200 bytes, and the persisted
+      // set is still truncated here so nothing grows without limit. Paying a
+      // lock acquisition on every search to save a few hundred bytes in a
+      // rare race would cost more than the race does -- this is a budget
+      // heuristic, not a correctness invariant.
+      advised: [
+        ...new Set([...(current.advised || []), ...(state.advised || [])]),
+      ].slice(0, ADVISED_CAP),
       // An inventory is a point-in-time observation, not an append-only set.
       // Union would resurrect a tool after a newer host payload explicitly
       // reported an empty or reduced catalog. Latest evidence wins, including
