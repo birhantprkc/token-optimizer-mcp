@@ -30,7 +30,16 @@
 
 import { compressCode, looksLikeCode, looksLikeDiff } from './code.js';
 import { compressJson, looksLikeJson } from './json.js';
+import {
+  compressJsonSections,
+  looksLikeJsonSections,
+} from './json-sections.js';
 import { compressLog, looksLikeLog } from './log.js';
+import { compressTap, looksLikeTap } from './tap.js';
+import {
+  compressJsonFragments,
+  looksLikeJsonFragments,
+} from './json-fragments.js';
 import { compressProse, looksLikeProse } from './prose.js';
 import { compressSearchResults, looksLikeSearchResults } from './search.js';
 import { engineFor, registerEngine, runEngine } from './registry.js';
@@ -81,8 +90,11 @@ registerEngine({
 registerEngine({
   name: 'json',
   priority: 60,
-  claims: (text) => looksLikeJson(text),
-  compress: compressJson,
+  claims: (text) => looksLikeJson(text) || looksLikeJsonSections(text),
+  compress: (text, ctx) => {
+    const result = compressJson(text, ctx);
+    return result.text === text ? compressJsonSections(text, ctx) : result;
+  },
 });
 
 registerEngine({
@@ -95,8 +107,14 @@ registerEngine({
 registerEngine({
   name: 'log',
   priority: 40,
-  claims: (text) => looksLikeLog(text),
-  compress: compressLog,
+  claims: (text) =>
+    looksLikeJsonFragments(text) || looksLikeTap(text) || looksLikeLog(text),
+  compress: (text, ctx) =>
+    looksLikeJsonFragments(text)
+      ? compressJsonFragments(text)
+      : looksLikeTap(text)
+        ? compressTap(text)
+        : compressLog(text, ctx),
 });
 
 registerEngine({
@@ -167,14 +185,9 @@ export function compressBlock(
   if (numbering) {
     const inner = compressBlock(numbering.stripped, ctx);
     if (inner.text === numbering.stripped) return unchanged(text);
-    // The engine's own elision count is its marker budget: it may add one line
-    // per elision and no more. Anything further means it rewrote a line it was
-    // supposed to keep, and `restore` then declines rather than emitting
-    // partially numbered output.
-    return {
-      ...inner,
-      text: numbering.restore(inner.text, inner.elisions.length),
-    };
+    // Only exact inserted markers may be unnumbered; rewrites fail closed.
+    const restored = numbering.restore(inner.text, inner.insertedLines);
+    return restored === null ? unchanged(text) : { ...inner, text: restored };
   }
   const engine = engineFor(text, ctx);
   if (!engine) return unchanged(text);

@@ -27,6 +27,9 @@
 import { appendFileSync } from 'node:fs';
 import type { Readable, Writable } from 'node:stream';
 import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
+import * as zlib from 'node:zlib';
+import { StringDecoder } from 'node:string_decoder';
+import { UsageParser } from './usage-parser.js';
 
 /** The token classes a provider bills separately. */
 export interface RequestUsage {
@@ -34,6 +37,8 @@ export interface RequestUsage {
   output_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
+  /** Responses input_tokens includes this subset; do not add it a second time. */
+  cached_input_tokens?: number;
 }
 
 const USAGE_KEYS = [
@@ -41,14 +46,8 @@ const USAGE_KEYS = [
   'output_tokens',
   'cache_creation_input_tokens',
   'cache_read_input_tokens',
+  'cached_input_tokens',
 ] as const;
-
-/**
- * How much of the previous chunk to re-scan, so a `usage` object split across a
- * chunk boundary is still seen whole. The objects in question are well under
- * this; the cost is re-scanning a few hundred bytes per chunk.
- */
-const CARRY_CHARS = 512;
 
 /**
  * Pulls usage numbers out of a response fragment, keeping the LAST value seen
@@ -60,14 +59,32 @@ const CARRY_CHARS = 512;
  * occurrence is the total and an earlier one is a partial count.
  */
 export function scanUsage(text: string, into: RequestUsage): void {
+  new UsageParser((usage) => mergeUsage(usage, into)).write(text);
+}
+
+function mergeUsage(usage: Record<string, unknown>, into: RequestUsage): void {
+  const assign = (key: keyof RequestUsage, value: unknown): void => {
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)
+      into[key] = value;
+  };
+  for (const [wire, canonical] of [
+    ['prompt_tokens', 'input_tokens'],
+    ['completion_tokens', 'output_tokens'],
+  ] as const) {
+    assign(canonical, usage[wire]);
+  }
   for (const key of USAGE_KEYS) {
-    // Anchored on the quoted key, so a field merely CONTAINING this name --
-    // `cache_read_input_tokens` contains `input_tokens` -- cannot match it.
-    const pattern = new RegExp(`"${key}"[ \\t]*:[ \\t]*(\\d+)`, 'g');
-    let match: RegExpExecArray | null;
-    let last: string | undefined;
-    while ((match = pattern.exec(text)) !== null) last = match[1];
-    if (last !== undefined) into[key] = Number(last);
+    assign(key, usage[key]);
+  }
+  // Responses reports cache reads inside input_tokens_details. Keep its native
+  // semantics separate from Anthropic's exclusive token classes.
+  for (const key of ['input_tokens_details', 'prompt_tokens_details']) {
+    const details = usage[key];
+    if (details && typeof details === 'object' && !Array.isArray(details))
+      assign(
+        'cached_input_tokens',
+        (details as Record<string, unknown>).cached_tokens
+      );
   }
 }
 
@@ -77,6 +94,9 @@ export interface CompressionFacts {
   readonly reason?: string;
   readonly anchorReason?: string;
   readonly elisions?: number;
+  /** References actually forwarded by the Responses deduplicator. */
+  readonly dedupReferences?: number;
+
   readonly deferredTools?: number;
   readonly deferredToolChars?: number;
   /**
@@ -104,9 +124,17 @@ export interface CompressionFacts {
 
 /** One line of the ledger: what we sent, and what it was billed as. */
 export interface AccountingRecord extends CompressionFacts {
+  /** Monotonic durations. Upstream includes transport and provider processing. */
+  readonly timing?: {
+    readonly transformMs: number;
+    readonly upstreamHeadersMs?: number;
+    readonly upstreamMs: number;
+  };
   readonly ts: string;
   readonly path: string;
   readonly status: number;
+  /** No HTTP response was received; usage remains unknown, not zero. */
+  readonly transportError?: string;
   readonly usage: RequestUsage;
 }
 
@@ -151,9 +179,8 @@ export function appendRecord(path: string, record: AccountingRecord): void {
  * unchanged -- which matters more here than anywhere, because an SSE stream has
  * to arrive as it is produced and this is a byte-faithful proxy.
  *
- * BOUNDED. It keeps a few hundred characters of overlap and nothing else, so a
- * long response costs a constant amount of memory rather than being buffered to
- * be measured.
+ * BOUNDED. The parser retains only bounded usage objects and structural state,
+ * never the assistant's response content.
  */
 export function tapUsage(
   stream: Readable,
@@ -161,8 +188,10 @@ export function tapUsage(
   contentEncoding?: string
 ): void {
   const usage: RequestUsage = {};
-  let carry = '';
+  const parser = new UsageParser((value) => mergeUsage(value, usage));
+  const utf8 = new StringDecoder('utf8');
   let settled = false;
+  let settling = false;
 
   // DECODED BEFORE IT IS SCANNED, or the scan reads compressed bytes as text
   // and finds nothing. The first live run recorded 23 requests with correct
@@ -178,6 +207,7 @@ export function tapUsage(
   const finish = (): void => {
     if (settled) return;
     settled = true;
+    parser.write(utf8.end());
     try {
       done(usage);
     } catch {
@@ -186,15 +216,13 @@ export function tapUsage(
   };
 
   const absorb = (text: string): void => {
-    const combined = carry + text;
-    scanUsage(combined, usage);
-    carry = combined.slice(Math.max(0, combined.length - CARRY_CHARS));
+    parser.write(text);
   };
 
   if (decoder) {
     decoder.on('data', (chunk: Buffer) => {
       try {
-        absorb(chunk.toString('utf8'));
+        absorb(utf8.write(chunk));
       } catch {
         // Instrumentation only.
       }
@@ -210,7 +238,7 @@ export function tapUsage(
         decoder.write(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
         return;
       }
-      absorb(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+      absorb(typeof chunk === 'string' ? chunk : utf8.write(chunk));
     } catch {
       // A chunk that will not decode tells us nothing; the response is
       // unaffected either way.
@@ -222,6 +250,8 @@ export function tapUsage(
   // With a decoder in play the trailing bytes only emerge once it is ended, so
   // the ledger waits for the decoder to flush rather than for the socket.
   const settle = (): void => {
+    if (settling) return;
+    settling = true;
     if (!decoder) {
       finish();
       return;
@@ -260,5 +290,7 @@ function decoderFor(contentEncoding?: string): (Writable & Readable) | null {
   if (encoding === 'gzip' || encoding === 'x-gzip') return createGunzip();
   if (encoding === 'deflate') return createInflate();
   if (encoding === 'br') return createBrotliDecompress();
+  if (encoding === 'zstd' && typeof zlib.createZstdDecompress === 'function')
+    return zlib.createZstdDecompress();
   return null;
 }

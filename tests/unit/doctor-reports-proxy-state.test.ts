@@ -15,17 +15,37 @@ const detailOf = (checks: Array<Record<string, unknown>>): string =>
   checks.map((c) => JSON.stringify(c)).join(' ');
 
 describe('probeProxy', () => {
+  it('uses the MCP handshake identity when the client environment was filtered', () => {
+    const checks = probeProxy({}, { clientName: 'codex-mcp' });
+    expect(checks[0].pass).toBe(false);
+    expect(detailOf(checks)).toContain('OPENAI_BASE_URL');
+    expect(detailOf(checks)).toContain('token-optimizer-run codex');
+    expect(detailOf(checks)).not.toContain('no supported way');
+  });
+
+  it('does not classify an unidentified MCP host as an unsupported client', () => {
+    const checks = probeProxy({});
+    expect(checks[0].pass).toBe(false);
+    expect(detailOf(checks)).toContain('routing is unverified');
+  });
+
+  it('does not disclose upstream credentials in diagnostic output', () => {
+    const checks = probeProxy({ TOKEN_OPTIMIZER_CLIENT: 'codex', OPENAI_BASE_URL: 'https://secret@example.com/?key=private' });
+    expect(checks[0].pass).toBe(false);
+    expect(detailOf(checks)).not.toContain('secret');
+    expect(detailOf(checks)).not.toContain('private');
+  });
   it('says nothing at all when the whole optimizer is off', () => {
     // A proxy note stacked on top of "everything is off" is noise, which is
     // how probeHarvest already treats the same case.
     expect(probeProxy({ TOKEN_OPTIMIZER_PROXY: '1', TOKEN_OPTIMIZER_MODE: 'off' })).toEqual([]);
   });
 
-  it('passes when the proxy is off, and names what it would buy', () => {
-    const checks = probeProxy({});
+  it('passes when the proxy is explicitly disabled', () => {
+    const checks = probeProxy({ TOKEN_OPTIMIZER_PROXY: '0' });
     expect(checks).toHaveLength(1);
     expect(checks[0].pass).toBe(true);
-    expect(detailOf(checks)).toContain('TOKEN_OPTIMIZER_PROXY=1');
+    expect(detailOf(checks)).toContain('opts out');
   });
 
   it('FAILS when the proxy is on but the client was never pointed at it', () => {

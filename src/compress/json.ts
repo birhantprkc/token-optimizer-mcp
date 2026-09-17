@@ -7,9 +7,8 @@
  *
  * WHAT IS DROPPED, AND WHETHER IT CAN COME BACK:
  *
- *   whitespace          lossless -- re-serialising restores it exactly
- *   nulls               lossless -- absent and null are the same to a reader,
- *                       and the key list is recoverable from the surviving rows
+ *   whitespace          preserves parsed values; original formatting is not retained
+ *   nulls               retained -- absent and null are distinct
  *   long array tails    LOSSY -- spilled to a path, or the count is stated so
  *                       the model knows what it is not seeing
  *
@@ -36,6 +35,14 @@
  */
 
 import { count, inlineMarker } from './annotate.js';
+import { numericExtrema } from './json-numeric.js';
+import { compressJsonArray } from './json-fragments.js';
+import {
+  booleanFacts,
+  nullFacts,
+  rareBooleanRows,
+  rareStringGroups,
+} from './json-facts.js';
 import { needleRows, shapeRepresentatives } from './needles.js';
 import { compressNestedStrings } from './nested.js';
 import { activeRanker } from './ranking.js';
@@ -50,35 +57,6 @@ export function looksLikeJson(text: string): boolean {
   const first = trimmed[0];
   const last = trimmed[trimmed.length - 1];
   return (first === '{' && last === '}') || (first === '[' && last === ']');
-}
-
-/** Strips null-valued keys, recursively. Absent and null read the same. */
-function dropNulls(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(dropNulls);
-  if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (v === null) continue;
-      out[k] = dropNulls(v);
-    }
-    return out;
-  }
-  return value;
-}
-
-/** Counts nulls before they are dropped, so the marker can be honest. */
-function countNulls(value: unknown): number {
-  if (Array.isArray(value))
-    return value.reduce<number>((n, v) => n + countNulls(v), 0);
-  if (value && typeof value === 'object') {
-    let n = 0;
-    for (const v of Object.values(value as Record<string, unknown>)) {
-      if (v === null) n += 1;
-      else n += countNulls(v);
-    }
-    return n;
-  }
-  return 0;
 }
 
 /** A one-line description of a row's shape, for the elision marker. */
@@ -144,7 +122,7 @@ function deviationOf(
 function anomalousRows(
   rows: readonly unknown[],
   maxPerDeviation: number
-): Set<number> {
+): { selected: Set<number>; all: number[] } {
   const frequency = new Map<string, number>();
   let objects = 0;
 
@@ -155,7 +133,7 @@ function anomalousRows(
       frequency.set(key, (frequency.get(key) ?? 0) + 1);
     }
   }
-  if (!objects) return new Set();
+  if (!objects) return { selected: new Set(), all: [] };
 
   const common = new Set(
     [...frequency.entries()]
@@ -185,7 +163,9 @@ function anomalousRows(
     // than an arbitrary slice -- the same bias the head-of-array rule uses.
     for (const index of indices.slice(0, maxPerDeviation)) odd.add(index);
   }
-  return odd;
+  // Keep the full population for claims about completeness, independently of
+  // the capped representatives selected for compression.
+  return { selected: odd, all: [...byDeviation.values()].flat() };
 }
 
 /**
@@ -202,6 +182,25 @@ export function compressJson(
 ): CompressionResult {
   if (!looksLikeJson(text)) return unchanged(text);
 
+  // Parsing unsafe integers would round their original lexemes, including in
+  // recovery data. Use the lexical codec or preserve the original document.
+  // Ordinary integer literals need no token scan; exponents may still overflow.
+  if (/\d{16}|[eE][+-]?\d/.test(text)) {
+    const tokens = text.matchAll(
+      /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/g
+    );
+    for (const [token] of tokens) {
+      if (token.startsWith('"')) continue;
+      const value = Number(token);
+      if (
+        !Number.isFinite(value) ||
+        (Number.isInteger(value) && !Number.isSafeInteger(value))
+      ) {
+        const exact = compressJsonArray(text);
+        return exact.text.length < text.length ? exact : unchanged(text);
+      }
+    }
+  }
   let parsed: unknown;
   let nestedElisions: readonly Elision[] = [];
   // Set when a nested string was compressed lossily. Every `lossless: !nestedLossy`
@@ -241,20 +240,8 @@ export function compressJson(
 
   const elisions: Elision[] = [...nestedElisions];
 
-  const nulls = countNulls(parsed);
-  const stripped = nulls ? dropNulls(parsed) : parsed;
-  if (nulls) {
-    // Lossless: absent and null read the same, and the surviving rows carry
-    // the key list.
-    elisions.push({
-      removed: count(nulls, 'null field'),
-      recoverAt: null,
-      // This ELISION is lossless on its own terms whatever happened elsewhere:
-      // an absent key and a null key read the same. Per-elision flags describe
-      // their own transform; the document-level claim is the engine's return.
-      lossless: true,
-    });
-  }
+  // Null and absent are different values. Preserve nulls in visible and recovery data.
+  const stripped = parsed;
 
   const minified = JSON.stringify(stripped);
   // Whitespace is recorded only when there actually was some to remove.
@@ -284,8 +271,28 @@ export function compressJson(
     // elided, 25.7% against their 60.0%) and keeps nothing when every row is
     // shaped alike (their agentic-conversation, 0 flagged, 45 of 48 rows
     // elided, every needle destroyed at 99.6%).
-    const odd = anomalousRows(stripped, tuning.keepRows);
-    const keep = new Set<number>();
+    const { selected: odd, all: differing } = anomalousRows(
+      stripped,
+      tuning.keepRows
+    );
+    const keep = rareBooleanRows(stripped);
+    const hasRareBooleans = keep.size > 0;
+    const extrema = numericExtrema(stripped);
+    for (const i of extrema.keep) keep.add(i);
+    const categories = rareStringGroups(parsed as unknown[]);
+    // Numeric tables have no rare categorical population to summarize. Keeping
+    // every record in an exact compact form avoids forcing verification reads
+    // for aggregate queries. Prefer it only when it materially beats minification.
+    if (
+      extrema.keep.size &&
+      !hasRareBooleans &&
+      !categories.keep.size &&
+      !nestedElisions.length
+    ) {
+      const exact = compressJsonArray(text);
+      if (exact.text.length < minified.length * 0.7) return exact;
+    }
+    for (const i of categories.keep) keep.add(i);
     // 1. Content that a reader would come back for -- identifiers, failure
     //    vocabulary -- which structure cannot see. Bounded, so an array made
     //    of needles does not simply disable compression.
@@ -335,9 +342,13 @@ export function compressJson(
       ',' +
       inlineMarker(
         `${count(dropped, 'more row')}, ${shapeOf(sample)}` +
-          (odd.size
-            ? `; all ${count(odd.size, 'row')} that differ are kept above`
-            : ''),
+          (differing.length && differing.every((i) => keep.has(i))
+            ? `; all ${count(differing.length, 'row')} that differ are kept above`
+            : '') +
+          booleanFacts(parsed as unknown[]) +
+          nullFacts(parsed as unknown[]) +
+          categories.facts +
+          extrema.facts,
         recoverAt
       ) +
       ']';

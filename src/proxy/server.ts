@@ -47,6 +47,7 @@ import {
   deferTools,
   withAdvancedToolUse,
   DEFAULT_KEEP_RELEVANT,
+  SMALL_TOOL_CHARS,
 } from '../compress/tools.js';
 import {
   accountingPath,
@@ -55,6 +56,10 @@ import {
   type CompressionFacts,
 } from './accounting.js';
 import { anchorStore, type AnchorStore } from '../compress/anchor.js';
+import { captureDir, captureRequest } from './capture.js';
+import { compressResponses } from './responses.js';
+import { compressChatCompletions } from './chat-completions.js';
+import { withResponsesKnowledge } from './responses-knowledge.js';
 import type { Finding } from '../compress/knowledge.js';
 import { loadFindingsFrom } from './findings.js';
 import {
@@ -154,6 +159,8 @@ export interface ProxyOptions {
    * rest of this package resolves a project from.
    */
   readonly projectRoot?: string;
+  /** Disable graph injection when a client chooses its working tree after launch. */
+  readonly knowledge?: boolean;
   /** Named starting point for the dials. Defaults to the environment's. */
   readonly preset?: PresetName | string;
   /** Expert overrides, layered over the preset. */
@@ -210,10 +217,10 @@ export interface ProxySummary {
   readonly messageCount?: number;
 }
 
-/** Enabled only on an explicit opt-in, and never when the kill switch is set. */
+/** Enabled by default; explicit opt-outs and the global kill switch win. */
 export function proxyEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env.TOKEN_OPTIMIZER_MODE === 'off') return false;
-  return /^(1|true|yes|on)$/i.test(env.TOKEN_OPTIMIZER_PROXY || '');
+  if (env.TOKEN_OPTIMIZER_MODE?.trim().toLowerCase() === 'off') return false;
+  return !/^(0|false|no|off)$/i.test(env.TOKEN_OPTIMIZER_PROXY?.trim() || '');
 }
 
 /**
@@ -334,7 +341,8 @@ export function compressBody(
   findings?: readonly Finding[],
   tuning?: Tuning,
   /** True when `findings` came from a graph shared across projects. */
-  sharedGraph?: boolean
+  sharedGraph?: boolean,
+  wireFormat?: 'chat-completions'
 ): { body: Buffer; summary: Omit<ProxySummary, 'path'> } {
   const before = body.length;
   const unchanged = (reason: string) => ({
@@ -417,8 +425,8 @@ export function compressBody(
       },
     };
   }
-
-  if (before < MIN_BYTES) return unchanged('below the size floor');
+  if (before < MIN_BYTES && !anchors && !findings?.length)
+    return unchanged('below the size floor');
 
   let parsed: ProviderRequest;
   try {
@@ -427,6 +435,43 @@ export function compressBody(
     // Not a JSON provider request -- a streaming upload, a form, something
     // else entirely. Forward it untouched.
     return unchanged('body is not JSON');
+  }
+  if (!parsed || typeof parsed !== 'object')
+    return unchanged('not a request object');
+  if (wireFormat === 'chat-completions' && Array.isArray(parsed.messages)) {
+    try {
+      return compressChatCompletions(
+        body,
+        parsed as Record<string, unknown>,
+        spill,
+        anchors,
+        findings,
+        tuning,
+        sharedGraph
+      );
+    } catch {
+      return unchanged('Chat Completions compression failed');
+    }
+  }
+  if (Array.isArray(parsed.input)) {
+    try {
+      const result = compressResponses(
+        body,
+        parsed as unknown as Record<string, unknown>,
+        spill,
+        tuning
+      );
+      return withResponsesKnowledge(
+        result,
+        parsed as unknown as Record<string, unknown>,
+        anchors,
+        findings,
+        tuning,
+        sharedGraph
+      );
+    } catch {
+      return unchanged('Responses compression failed');
+    }
   }
   if (!Array.isArray(parsed.messages)) return unchanged('no messages array');
 
@@ -452,11 +497,7 @@ export function compressBody(
   // Set TOKEN_OPTIMIZER_PROXY_DEFER_TOOLS=0 to turn it off.
   let deferred = 0;
   let deferredChars = 0;
-  if (
-    !/^(0|false|no|off)$/i.test(
-      process.env.TOKEN_OPTIMIZER_PROXY_DEFER_TOOLS || ''
-    )
-  ) {
+  if (deferToolsEnabled()) {
     try {
       // The task text steers which non-core tools stay loaded, so the model
       // never has to search for one -- and a search costs a round trip plus a
@@ -467,6 +508,7 @@ export function compressBody(
         // the prefix every turn. See taskIn for the measurement.
         query: taskIn(parsed),
         keepRelevant: keepToolsFromEnv(),
+        smallToolChars: smallToolCharsFromEnv(),
       });
       parsed = out.request;
       deferred = out.deferredCount;
@@ -685,13 +727,8 @@ const HOP_BY_HOP = new Set([
 ]);
 
 /**
- * Is the cached-knowledge block switched on?
- *
- * SEPARATE FROM THE PROXY SWITCH, and off unless asked for. Compression
- * removes tokens; this ADDS them, and it is justified by turns rather than
- * by size -- a claim this repository cannot yet make, because only THOL
- * measures turns and it has not been run against this. Folding an unproven
- * addition into a proven reduction would make the reduction untrue.
+ * Knowledge is enabled by default, with a separate opt-out. Its added characters
+ * are reported separately: activation is not evidence of net cost savings.
  */
 /**
  * How stale the in-memory findings may get before a background re-read.
@@ -705,8 +742,12 @@ const HOP_BY_HOP = new Set([
 const FINDINGS_REFRESH_MS = 60_000;
 
 export function knowledgeEnabled(env: NodeJS.ProcessEnv): boolean {
-  if (env.TOKEN_OPTIMIZER_MODE === 'off') return false;
-  return /^(1|true|yes|on)$/i.test(env.TOKEN_OPTIMIZER_PROXY_KNOWLEDGE || '');
+  return (
+    proxyEnabled(env) &&
+    !/^(0|false|no|off)$/i.test(
+      env.TOKEN_OPTIMIZER_PROXY_KNOWLEDGE?.trim() || ''
+    )
+  );
 }
 
 /**
@@ -753,6 +794,36 @@ export function keepToolsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   if (raw === undefined || raw.trim() === '') return DEFAULT_KEEP_RELEVANT;
   const n = Number(raw);
   if (!Number.isInteger(n) || n < 0) return DEFAULT_KEEP_RELEVANT;
+  return n;
+}
+
+/** Deferral defaults on unless the environment explicitly disables it. */
+export function deferToolsEnabled(
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  return !/^(0|false|no|off)$/i.test(
+    env.TOKEN_OPTIMIZER_PROXY_DEFER_TOOLS || ''
+  );
+}
+
+/**
+ * Below how many characters a tool definition is exempt from deferral.
+ * The previous default exempted definitions below 1,500 characters to avoid
+ * discovery round trips. Captured traffic showed that 88 of 115 real tools
+ * fell under that floor, leaving about 55 KB undeferred; tool definitions were
+ * 66.9% of the request. That aggregate cost motivated removing the default floor.
+ *
+ * `SMALL_TOOL_CHARS` is now zero: every eligible definition may be deferred.
+ * TOKEN_OPTIMIZER_PROXY_SMALL_TOOL_CHARS can restore a positive exemption for
+ * workloads where discovery round trips cost more than the saved definition.
+ */
+export function smallToolCharsFromEnv(
+  env: NodeJS.ProcessEnv = process.env
+): number {
+  const raw = env.TOKEN_OPTIMIZER_PROXY_SMALL_TOOL_CHARS;
+  if (raw === undefined || raw.trim() === '') return SMALL_TOOL_CHARS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) return SMALL_TOOL_CHARS;
   return n;
 }
 
@@ -820,7 +891,8 @@ function forward(
   req: IncomingMessage,
   res: ServerResponse,
   body: Buffer,
-  facts?: CompressionFacts
+  facts?: CompressionFacts,
+  transformMs = 0
 ): void {
   const path = requestPath(req.url);
   if (path === null) {
@@ -872,6 +944,9 @@ function forward(
       req.headers['anthropic-beta']
     );
 
+  const upstreamStarted = performance.now();
+  let upstreamHeadersMs: number | undefined;
+  let receivedResponse = false;
   const upstreamReq = send(
     {
       protocol: target.protocol,
@@ -882,6 +957,8 @@ function forward(
       headers,
     },
     (upstreamRes) => {
+      receivedResponse = true;
+      upstreamHeadersMs = performance.now() - upstreamStarted;
       // HOP-BY-HOP HEADERS ARE STRIPPED IN BOTH DIRECTIONS, and doing it in
       // only one was a real defect rather than an untidiness.
       //
@@ -937,19 +1014,50 @@ function forward(
               path: requestPath(req.url) ?? '/',
               status: upstreamRes.statusCode || 0,
               ...facts,
+              timing: {
+                transformMs,
+                upstreamHeadersMs,
+                upstreamMs: performance.now() - upstreamStarted,
+              },
               usage,
             });
           },
           typeof encoding === 'string' ? encoding : undefined
         );
       }
+      // Codex closes after its terminal SSE event, even if the provider keeps
+      // the stream open. Cancel that upstream stream so its usage is settled.
+      res.once('close', () => {
+        if (!upstreamRes.complete) upstreamRes.destroy();
+      });
       // Piped, not buffered: an SSE stream must arrive as it is produced, or
       // the agent sits waiting for a response that has already started.
       upstreamRes.pipe(res);
     }
   );
 
+  res.once('close', () => upstreamReq.destroy());
   upstreamReq.on('error', (error) => {
+    // A connection failure has no response stream for tapUsage to observe.
+    // Keep the attempted request in the ledger with unknown usage, never zero.
+    const ledger = facts ? accountingPath() : null;
+    if (!receivedResponse && ledger && facts) {
+      receivedResponse = true;
+      appendRecord(ledger, {
+        ts: new Date().toISOString(),
+        path: requestPath(req.url) ?? '/',
+        status: 0,
+        ...facts,
+        timing: {
+          transformMs,
+          upstreamHeadersMs,
+          upstreamMs: performance.now() - upstreamStarted,
+        },
+        transportError:
+          (error as NodeJS.ErrnoException).code ?? 'UPSTREAM_ERROR',
+        usage: {},
+      });
+    }
     if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
     res.end(`token-optimizer proxy: upstream request failed: ${error.message}`);
   });
@@ -1008,7 +1116,8 @@ export async function startProxy(
   );
   // Read at startup, then refreshed in the background -- see the block below,
   // which owns the reasoning about why the refresh cannot be synchronous.
-  const knowledgeOn = knowledgeEnabled(process.env);
+  const knowledgeOn =
+    options.knowledge !== false && knowledgeEnabled(process.env);
   const graphRoot = options.projectRoot || process.cwd();
   const loaded = knowledgeOn
     ? await loadFindingsFrom(graphRoot)
@@ -1059,6 +1168,7 @@ export async function startProxy(
   const guessing = upstreamIsDefault(options);
   const limit = bodyLimitFor(options);
 
+  let captureFailureWarned = false;
   const server = createServer((req, res) => {
     void (async () => {
       // VALIDATED BEFORE ANYTHING IS COMPRESSED, and the order is the fix. Compressing
@@ -1108,14 +1218,30 @@ export async function startProxy(
         res.writeHead(400).end();
         return;
       }
+      const capture = captureDir();
+      if (capture)
+        void captureRequest(capture, path, body).then((captured) => {
+          if (!captured && !captureFailureWarned) {
+            captureFailureWarned = true;
+            console.error(
+              'token-optimizer proxy: capture incomplete (write failed or memory queue full)'
+            );
+          }
+        });
 
+      const transformStarted = performance.now();
       const { body: next, summary } = compressBody(
         body,
         spill,
         anchors,
         findings,
         tuning,
-        sharedGraphFlag
+        sharedGraphFlag,
+        /\/chat\/completions\/?$/.test(
+          (requestPath(req.url) ?? '').split('?')[0]
+        )
+          ? 'chat-completions'
+          : undefined
       );
       refreshFindings();
       options.onSummary?.({ path: req.url || '/', ...summary });
@@ -1126,7 +1252,14 @@ export async function startProxy(
       // knowledge block read its own effect as zero. The summary IS the
       // compression facts -- every field of it belongs in the ledger, and a
       // field added to one should never need remembering in the other.
-      forward(upstream, req, res, next, summary);
+      forward(
+        upstream,
+        req,
+        res,
+        next,
+        summary,
+        performance.now() - transformStarted
+      );
     })();
   });
 

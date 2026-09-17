@@ -51,7 +51,7 @@
   },
   "src/server/index.ts": {
     "n/no-sync": {
-      "count": 11
+      "count": 10
     }
   },
   "src/server/mcp-diagnostics.ts": {
@@ -221,7 +221,7 @@
   },
   "src/tools/file-operations/smart-edit.ts": {
     "n/no-sync": {
-      "count": 3
+      "count": 2
     }
   },
   "src/tools/file-operations/smart-glob.ts": {

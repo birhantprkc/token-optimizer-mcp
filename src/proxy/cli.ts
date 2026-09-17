@@ -19,6 +19,7 @@
  */
 
 import { startProxy, proxyEnabled } from './server.js';
+import { captureDir, captureNotice } from './capture.js';
 import type { ProxySummary } from './server.js';
 
 interface Args {
@@ -54,7 +55,7 @@ const USAGE = [
   '  variable each of the 16 clients reads, and which of them cannot be',
   '  redirected at all.',
   '',
-  '  Enable with TOKEN_OPTIMIZER_PROXY=1; running this command counts as that.',
+  '  Enabled by default; TOKEN_OPTIMIZER_PROXY=0 opts out.',
   '  TOKEN_OPTIMIZER_MODE=off overrides it and the proxy refuses to start.',
   '',
   '  Stdout is exactly one line: the URL. Everything else is stderr.',
@@ -161,15 +162,14 @@ export async function run(argv: readonly string[]): Promise<number> {
   // THE KILL SWITCH STILL WINS over running this deliberately. Someone who set
   // TOKEN_OPTIMIZER_MODE=off has said the product must do nothing, and a proxy
   // that ignored that would be the one component able to override it.
-  if (process.env.TOKEN_OPTIMIZER_MODE === 'off') {
+  if (!proxyEnabled(process.env)) {
     process.stderr.write(
-      'token-optimizer-proxy: TOKEN_OPTIMIZER_MODE=off, refusing to start.\n'
+      'token-optimizer-proxy: disabled (TOKEN_OPTIMIZER_MODE=off or TOKEN_OPTIMIZER_PROXY=0).\n'
     );
     return 3;
   }
   // Running the command IS the opt-in, so the flag is set here for the checks
   // downstream that read it, rather than demanded of the caller as well.
-  if (!proxyEnabled(process.env)) process.env.TOKEN_OPTIMIZER_PROXY = '1';
 
   let started: Awaited<ReturnType<typeof startProxy>>;
   try {
@@ -209,7 +209,12 @@ export async function run(argv: readonly string[]): Promise<number> {
   const url = `http://127.0.0.1:${started.port}`;
   process.stdout.write(`${url}\n`);
   process.stderr.write(
-    `token-optimizer proxy listening on ${url}, forwarding to ` +
+    // ANNOUNCED EVERY TIME, never once and never quietly. Capture writes
+    // conversation content to disk, which is the opposite of what this proxy
+    // otherwise promises, so an operator must not be able to leave it on by
+    // accident and not notice.
+    (captureDir() ? `${captureNotice(captureDir() ?? '')}\n` : '') +
+      `token-optimizer proxy listening on ${url}, forwarding to ` +
       `${args.upstream || process.env.TOKEN_OPTIMIZER_PROXY_UPSTREAM || DEFAULT_UPSTREAM}\n`
   );
 

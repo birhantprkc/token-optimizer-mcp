@@ -55,7 +55,7 @@ import {
 import {
   runSmartComplexity,
   SMART_COMPLEXITY_TOOL_DEFINITION,
-} from '../tools/code-analysis/smart-complexity.js';
+} from '../tools/code-analysis/lazy-tools.js';
 import {
   runSmartDependencies,
   SMART_DEPENDENCIES_TOOL_DEFINITION,
@@ -63,15 +63,15 @@ import {
 import {
   runSmartExports,
   SMART_EXPORTS_TOOL_DEFINITION,
-} from '../tools/code-analysis/smart-exports.js';
+} from '../tools/code-analysis/lazy-tools.js';
 import {
   runSmartImports,
   SMART_IMPORTS_TOOL_DEFINITION,
-} from '../tools/code-analysis/smart-imports.js';
+} from '../tools/code-analysis/lazy-tools.js';
 import {
   runSmartRefactor,
   SMART_REFACTOR_TOOL_DEFINITION,
-} from '../tools/code-analysis/smart-refactor.js';
+} from '../tools/code-analysis/lazy-tools.js';
 import {
   runSmartSecurity,
   SMART_SECURITY_TOOL_DEFINITION,
@@ -79,11 +79,11 @@ import {
 import {
   runSmartSymbols,
   SMART_SYMBOLS_TOOL_DEFINITION,
-} from '../tools/code-analysis/smart-symbols.js';
+} from '../tools/code-analysis/lazy-tools.js';
 import {
   runSmartTypescript,
   SMART_TYPESCRIPT_TOOL_DEFINITION,
-} from '../tools/code-analysis/smart-typescript.js';
+} from '../tools/code-analysis/lazy-tools.js';
 import {
   runSmartConfigRead,
   SMART_CONFIG_READ_TOOL_DEFINITION,
@@ -239,7 +239,7 @@ import { SessionManager } from '../core/session-manager.js';
 import { createSummarizerFromEnv } from '../core/summarization.js';
 import { TokenizerFactory } from '../core/tokenizers/tokenizer-factory.js';
 import { ConfigManager } from '../core/config.js';
-import { lruMemoize, memoRegistry } from '../utils/lru-memoize.js';
+import { memoRegistry } from '../utils/lru-memoize.js';
 import { AnalyticsManager } from '../analytics/analytics-manager.js';
 
 // API & Database tools
@@ -382,7 +382,7 @@ import {
   resolveSessionLogPath,
 } from './session-log-parser.js';
 import fs from 'fs';
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import { isValidSessionId } from '../utils/session-id.js';
 import path from 'path';
 import os from 'os';
@@ -522,54 +522,11 @@ const sessionManager = new SessionManager({
 });
 const contextDelta = new ContextDeltaTool(sessionManager);
 
-// #125: memoize the expensive read-only file-operation tools with an
-// LRU bounded by the user's cacheSettings. The memoRegistry hook lets
-// the cleanup handler below prune them all at once.
-//
-// A MEMO KEYED ONLY ON ARGUMENTS SERVES CONTENT THAT NO LONGER EXISTS.
-//
-// These were keyed on the arguments alone, with a one-hour TTL. Measured
-// live: read a file, edit it, read it again with the same arguments, and the
-// PRE-EDIT content came back -- for an hour. Read-edit-read is the most common
-// sequence there is, so this was reachable in nearly every session, and a tool
-// whose whole job is reporting file contents cannot report contents the file
-// does not have.
-//
-// The tools' own caches were never the problem: those hash the file. The
-// defect was this second layer in front of them, which had no idea the
-// filesystem had moved.
-const cacheSettings = optimizationConfig.cacheSettings;
-
-/**
- * A cheap, exact stamp of the file a read is about.
- *
- * One stat: size and mtime, at nanosecond resolution where the platform
- * offers it. Any edit changes at least one of them, so an edited file yields a
- * different memo key and the entry is recomputed rather than replayed. A
- * missing file stamps as 'absent', so creating it is a change too.
- */
-function fileStamp(filePath: unknown): string {
-  if (typeof filePath !== 'string' || !filePath) return 'no-path';
-  try {
-    const st = fs.statSync(filePath);
-    return `${st.size}:${st.mtimeMs}`;
-  } catch {
-    return 'absent';
-  }
-}
-
-const memoizedSmartRead = lruMemoize(runSmartRead, {
-  name: 'smart_read',
-  maxSize: cacheSettings.maxSize,
-  ttlMs: cacheSettings.ttlSeconds * 1000,
-  // The file's identity is part of the question, not just its path.
-  keyFn: (args) =>
-    createHash('sha256')
-      .update(JSON.stringify(args))
-      .update('\0')
-      .update(fileStamp(args[0]))
-      .digest('hex'),
-});
+// A read depends on what this session has already seen, not just file bytes.
+// Memoizing the final response replayed a cold read verbatim on every unchanged
+// repeat, bypassing SmartRead's internal cache/diff logic. Let that layer own
+// caching, as it already does for changes, chunk navigation, and authored bases.
+const memoizedSmartRead = runSmartRead;
 
 // smart_grep and smart_glob SCAN A TREE, and no single stat describes a tree:
 // a file added three directories down changes the answer while every stat we
@@ -622,7 +579,12 @@ const server = new Server(
     version: packageVersion,
   },
   {
-    instructions: SERVER_INSTRUCTIONS,
+    instructions:
+      SERVER_INSTRUCTIONS +
+      ' Discover only the schema for the tool you need. In code-mode hosts with ' +
+      'ALL_TOOLS, filter by the exact tool-name suffix (for example __smart_read) ' +
+      'and print that entry only. To discover names, list names without descriptions ' +
+      'first. Broad catalog dumps can exhaust the context budget.',
     capabilities: {
       tools: {},
     },
@@ -3024,6 +2986,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) =>
         () =>
           installDoctor({
             ...(request.params.arguments as any),
+            clientName: server.getClientVersion()?.name,
             // A runtime fact no file inspection can reach: this process may be
             // running on an in-memory cache because the real one would not open.
             // Nothing persists in that state and nothing outside says so.
