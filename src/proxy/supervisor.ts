@@ -44,19 +44,51 @@ export function supervisorStateFile(
 }
 
 /**
+ * The first port the operating system may hand out as an OUTBOUND source port.
+ *
+ * Linux defaults to 32768-60999 and Windows and macOS to 49152-65535, so 32768 is the lowest
+ * floor any supported platform uses. Every port this module chooses to LISTEN on has to sit
+ * below it -- see routePort.
+ */
+const EPHEMERAL_FLOOR = 32768;
+
+/**
+ * The window route ports are derived from.
+ *
+ * BELOW EPHEMERAL_FLOOR, ABOVE THE WELL-KNOWN AND COMMON DEVELOPMENT PORTS. 17000-17999 is
+ * unregistered, clear of 3000/5000/8000/8080/9000 and their neighbours, and clear of the range
+ * the kernel allocates outbound source ports from.
+ */
+const ROUTE_BASE = 17000;
+const ROUTE_SPAN = 1000;
+
+/**
  * The control port.
  *
  * FIXED, because a caller has to find the supervisor without being told where it is, and an
- * ephemeral port would put that answer only in a file a stale reader could mis-read. 45710 sits in
- * the IANA dynamic range and is not a registered service.
+ * ephemeral port would put that answer only in a file a stale reader could mis-read.
+ *
+ * 16999 -- immediately below ROUTE_BASE, and below EPHEMERAL_FLOOR for the reason routePort
+ * records. The previous default, 45710, was chosen because it "sits in the IANA dynamic range";
+ * that is the range the kernel allocates outbound source ports from, so it was the defect rather
+ * than the justification.
  */
 export function controlPort(env: NodeJS.ProcessEnv = process.env): number {
   const raw = (env.TOKEN_OPTIMIZER_PROXY_CONTROL_PORT || '').trim();
-  if (!raw) return 45710;
+  if (!raw) return 16999;
   const port = Number(raw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(
       `TOKEN_OPTIMIZER_PROXY_CONTROL_PORT must be a port number, not '${raw}'`
+    );
+  }
+  // REFUSED RATHER THAN SILENTLY DEGRADED. Route ports no longer follow the control port, so a
+  // control port inside the route window is a real collision: whichever bound first would take
+  // it, and the loser would fall back to an ephemeral port -- the stable URL lost to a setting
+  // the user could simply have chosen differently. Cheaper to say so at startup.
+  if (port >= ROUTE_BASE && port < ROUTE_BASE + ROUTE_SPAN) {
+    throw new Error(
+      `TOKEN_OPTIMIZER_PROXY_CONTROL_PORT must not be ${ROUTE_BASE}-${ROUTE_BASE + ROUTE_SPAN - 1}, which is reserved for proxy routes`
     );
   }
   return port;
@@ -90,20 +122,30 @@ export interface SupervisorRoute {
  * listening on -- the one failure mode worse than saving nothing, because the client cannot reach
  * its provider at all.
  *
- * Derived rather than assigned so it survives the state file being lost, and taken from the IANA
- * dynamic range just above the control port. A collision with something else on the machine is
- * handled by the caller, which falls back to any free port and republishes.
+ * Derived rather than assigned so it survives the state file being lost.
+ *
+ * WHY NOT JUST ABOVE THE CONTROL PORT, WHICH IS WHAT THIS USED TO DO. With the old 45710 default
+ * that put route ports at 45712-46711, inside the range the kernel hands out as outbound source
+ * ports on every supported platform. A route port the kernel had transiently assigned to some
+ * unrelated outbound socket -- established, or merely in TIME_WAIT -- made portIsFree answer
+ * false, and the route was demoted to an ephemeral port: exactly the failure the paragraph above
+ * says must not happen. It surfaced as a Linux-only flake in the restart test, because the
+ * derived port was inside Linux's 32768-60999 but outside Windows' 49152-65535.
+ *
+ * So the window is FIXED at ROUTE_BASE, below EPHEMERAL_FLOOR, and no longer follows the control
+ * port. A collision with something else on the machine is handled by the caller, which retries
+ * the derived port before falling back to any free port and republishing.
  */
 export function routePort(
   upstream: string,
-  env: NodeJS.ProcessEnv = process.env
+  // Accepted so call sites and tests can keep pinning an environment; the window no longer
+  // depends on it.
+  _env: NodeJS.ProcessEnv = process.env
 ): number {
-  // CLAMPED, because controlPort accepts up to 65535: base would then exceed the port range and
-  // `base + hash % span` would derive an unlistenable port. Backing off leaves a usable window
-  // below the ceiling wherever the control port sits.
-  const ceiling = 65535;
-  const span = 1000;
-  const base = Math.min(controlPort(env) + 2, ceiling - span);
+  // The window must END below the floor, not merely start below it, or its top would be back
+  // inside the range the kernel allocates from.
+  const base = Math.min(ROUTE_BASE, EPHEMERAL_FLOOR - ROUTE_SPAN);
+  const span = ROUTE_SPAN;
   // FNV-1a: a few lines, stable across Node versions, and nothing here is security-sensitive.
   let hash = 0x811c9dc5;
   for (const character of upstream) {
@@ -120,6 +162,31 @@ function portIsFree(port: number): Promise<boolean> {
     probe.once('error', () => resolve(false));
     probe.listen(port, '127.0.0.1', () => probe.close(() => resolve(true)));
   });
+}
+
+/**
+ * The derived port, once it is free, or null if it stayed taken.
+ *
+ * WHY RETRY AT ALL, NOW THAT ROUTE_BASE IS OUTSIDE THE EPHEMERAL RANGE. Moving the window removed
+ * the cause that made this common -- the kernel's own outbound allocations -- but not every one.
+ * A supervisor restarted immediately after serving traffic can still meet its own previous
+ * listener in TIME_WAIT, and anything else on the machine may hold the port for a moment. Falling
+ * back on the FIRST refusal spends the stable URL, which is the whole point of deriving a port,
+ * to save less than a second of waiting.
+ *
+ * Bounded, because a port held by a real long-lived service will never come free, and a route on
+ * some other port still compresses. ~1s total: short next to the TIME_WAIT that usually clears
+ * it, and short enough that a genuinely occupied port does not delay a client's first request.
+ */
+async function derivedPortIfFree(port: number): Promise<number | null> {
+  const attempts = 5;
+  const gapMs = 200;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (await portIsFree(port)) return port;
+    if (attempt < attempts - 1)
+      await new Promise((resolve) => setTimeout(resolve, gapMs));
+  }
+  return null;
 }
 
 export interface SupervisorState {
@@ -171,9 +238,11 @@ async function control<T>(
 ): Promise<T | null> {
   return new Promise<T | null>((resolve) => {
     let settled = false;
+    let deadline: NodeJS.Timeout;
     const done = (value: T | null) => {
       if (!settled) {
         settled = true;
+        clearTimeout(deadline);
         resolve(value);
       }
     };
@@ -195,7 +264,16 @@ async function control<T>(
       },
       (res) => {
         const chunks: Buffer[] = [];
-        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        let size = 0;
+        res.on('error', () => done(null));
+        res.on('aborted', () => done(null));
+        res.on('data', (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > MAX_CONTROL_BODY * MAX_ROUTES) {
+            req.destroy();
+            done(null);
+          } else chunks.push(chunk);
+        });
         res.on('end', () => {
           if (res.statusCode !== 200) return done(null);
           try {
@@ -206,6 +284,11 @@ async function control<T>(
         });
       }
     );
+    // A trickling or aborted response must not stall every subsequent maintenance tick.
+    deadline = setTimeout(() => {
+      req.destroy();
+      done(null);
+    }, timeoutMs);
     req.on('error', () => done(null));
     req.on('timeout', () => {
       req.destroy();
@@ -220,11 +303,17 @@ async function control<T>(
 export async function supervisorHealth(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<{ ok: true; pid: number; routes: SupervisorRoute[] } | null> {
-  return control<{ ok: true; pid: number; routes: SupervisorRoute[] }>(
-    '/__token-optimizer/health',
-    undefined,
-    env
-  );
+  const health = await control<{
+    ok: true;
+    pid: number;
+    routes: SupervisorRoute[];
+  }>('/__token-optimizer/health', undefined, env);
+  return health?.ok === true &&
+    Number.isInteger(health.pid) &&
+    health.pid > 0 &&
+    Array.isArray(health.routes)
+    ? health
+    : null;
 }
 
 /**
@@ -242,22 +331,28 @@ export async function runSupervisor(
 } | null> {
   if (await supervisorHealth(env)) return null;
 
+  const saved = readSupervisorState(env);
+  let restoring = true;
+  let stopped = false;
+  let retryTimer: NodeJS.Timeout | undefined;
+  const waiting = new Map<string, SupervisorRoute>();
   const routes = new Map<string, SupervisorRoute>();
   // Held so shutdown can close them. Without this the listeners outlive every caller: a test run
   // never exits, and a supervisor asked to stop keeps the ports bound.
   const listeners = new Set<Server>();
-  const publish = () =>
+  const publish = () => {
+    if (restoring) return;
     writeState(
       {
         schema: 1,
         pid: process.pid,
         startedAt: new Date().toISOString(),
         controlUrl: `http://127.0.0.1:${controlPort(env)}`,
-        routes: [...routes.values()],
+        routes: [...waiting.values(), ...routes.values()],
       },
       env
     );
-
+  };
   // Keyed by upstream AND project, because those are two different listeners: the graph a proxy
   // serves is bound when it starts, so one route cannot answer for two projects.
   const keyOf = (upstream: string, project: string | null) =>
@@ -265,7 +360,8 @@ export async function runSupervisor(
   const starting = new Map<string, Promise<SupervisorRoute | null>>();
   const routeFor = async (
     upstream: string,
-    project: string | null
+    project: string | null,
+    savedPort?: number
   ): Promise<SupervisorRoute | null> => {
     const key = keyOf(upstream, project);
     const existing = routes.get(key);
@@ -280,10 +376,22 @@ export async function runSupervisor(
         //
         // Probed with a bare listener rather than by letting startProxy fail, because a startProxy
         // that rejects has already created its spill directory and has no close event to remove it.
-        const preferred = routePort(key, env);
+        const preferred =
+          savedPort ?? waiting.get(key)?.port ?? routePort(key, env);
+        // ONE PROBE, TWO READERS. #429 turned this from a single portIsFree into a bounded
+        // retry, and recovery below still has to refuse a port it was told to reuse. Probing
+        // twice would let the guard and the bind disagree -- the port can come free between
+        // them -- so the retry runs once and both read its answer.
+        const derived = await derivedPortIfFree(preferred);
+        // Existing clients have already loaded this URL. Retain it until we can bind it.
+        if (
+          stopped ||
+          (derived === null && (savedPort !== undefined || waiting.has(key)))
+        )
+          return null;
         const { server: listener, port } = await startProxy({
           upstream,
-          port: (await portIsFree(preferred)) ? preferred : 0,
+          port: derived ?? 0,
           // THE PROJECT IS THE CALLER'S, OR THERE IS NONE.
           //
           // `startProxy` binds the graph root once, from `projectRoot` or `process.cwd()`. The cwd
@@ -305,6 +413,7 @@ export async function runSupervisor(
           port,
           project,
         };
+        waiting.delete(key);
         routes.set(key, route);
         publish();
         return route;
@@ -331,6 +440,7 @@ export async function runSupervisor(
         });
         res.end(text);
       };
+      if (restoring) return reply(503, { error: 'restoring proxy routes' });
       if (path === '/__token-optimizer/health') {
         return reply(200, {
           ok: true,
@@ -384,7 +494,9 @@ export async function runSupervisor(
         if (
           !routes.has(key) &&
           !starting.has(key) &&
-          routes.size + starting.size >= MAX_ROUTES
+          !waiting.has(key) &&
+          new Set([...routes.keys(), ...waiting.keys(), ...starting.keys()])
+            .size >= MAX_ROUTES
         )
           return reply(429, { error: 'too many upstreams are already routed' });
         const route = await routeFor(upstream, project);
@@ -401,9 +513,49 @@ export async function runSupervisor(
     // LOOPBACK ONLY. This forwards provider credentials; it must never be reachable off-box.
     server.listen(controlPort(env), '127.0.0.1', resolve);
   });
+  // Restore every client's routes, including ports allocated after a collision. Active clients
+  // have already loaded these URLs; recomputing a port or restoring Claude alone strands them.
+  if (
+    saved?.controlUrl === `http://127.0.0.1:${controlPort(env)}` &&
+    Array.isArray(saved.routes)
+  ) {
+    for (const route of saved.routes.slice(0, MAX_ROUTES)) {
+      if (
+        !route ||
+        typeof route.upstream !== 'string' ||
+        (route.project !== null && typeof route.project !== 'string') ||
+        !Number.isInteger(route.port) ||
+        route.port < 1024 ||
+        route.port > 65535 ||
+        route.url !== `http://127.0.0.1:${route.port}`
+      )
+        continue;
+      const key = keyOf(route.upstream, route.project);
+      if (routes.has(key) || waiting.has(key)) continue;
+      waiting.set(key, route);
+      await routeFor(route.upstream, route.project, route.port);
+    }
+  }
+  restoring = false;
   publish();
 
+  const retry = async () => {
+    for (const route of waiting.values()) {
+      if (stopped) break;
+      await routeFor(route.upstream, route.project, route.port);
+    }
+    if (!stopped) {
+      retryTimer = setTimeout(() => void retry(), 1000);
+      retryTimer.unref();
+    }
+  };
+  retryTimer = setTimeout(() => void retry(), 1000);
+  retryTimer.unref();
+
   const close = async () => {
+    stopped = true;
+    clearTimeout(retryTimer);
+    await Promise.allSettled(starting.values());
     const all = [server, ...listeners];
     listeners.clear();
     routes.clear();
@@ -437,6 +589,7 @@ export async function ensureSupervisor(
 ): Promise<boolean> {
   if (await supervisorHealth(env)) return true;
   if (!autostartAllowed(env)) return false;
+  let spawnFailed = false;
   try {
     const entry = join(
       dirname(fileURLToPath(import.meta.url)),
@@ -448,6 +601,9 @@ export async function ensureSupervisor(
       env: { ...env },
       windowsHide: true,
     });
+    child.once('error', () => {
+      spawnFailed = true;
+    });
     child.unref();
   } catch {
     return false;
@@ -455,6 +611,7 @@ export async function ensureSupervisor(
   const deadline = Date.now() + waitMs;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 150));
+    if (spawnFailed) return false;
     if (await supervisorHealth(env)) return true;
   }
   return false;

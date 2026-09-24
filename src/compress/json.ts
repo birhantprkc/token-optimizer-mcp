@@ -36,7 +36,7 @@
 
 import { count, inlineMarker } from './annotate.js';
 import { numericExtrema } from './json-numeric.js';
-import { compressJsonArray } from './json-fragments.js';
+import { compressJsonArray, compressJsonObjectMap } from './json-fragments.js';
 import {
   booleanFacts,
   nullFacts,
@@ -203,6 +203,141 @@ function parseNdjson(text: string): unknown[] | null {
   return values.length >= 2 ? values : null;
 }
 
+/**
+ * Whitespace-only minification that keeps every token exactly as written.
+ *
+ * WHY NOT `JSON.stringify(JSON.parse(text))`, which is what this replaced.
+ * A round trip through the parser canonicalises every number, so `19.90`
+ * comes back `19.9`, `0.0500` comes back `0.05` and `1e3` comes back `1000`.
+ * Those bytes are unrecoverable from the output, and the result was still
+ * reporting `lossless: true` -- which claims the opposite. Measured on three
+ * ordinary documents (a service config, a pricing table, a metrics snapshot)
+ * the round trip destroyed 5, 6 and 7 distinct lexemes respectively while
+ * every one reported losslessly, and `JSON.parse` deep-equality is blind to
+ * it because the VALUES are identical. Only the source text differs, which
+ * is exactly what significant figures and currency display are made of.
+ *
+ * Scanning instead of parsing keeps the saving and makes the claim true: a
+ * string span is copied byte for byte, and everything outside one loses only
+ * its whitespace. Numbers are never interpreted, so they cannot be rewritten.
+ *
+ * Returns null when the scan cannot finish -- an unterminated string -- so
+ * the caller falls back rather than emitting a truncated document.
+ */
+function minifyPreservingTokens(text: string): string | null {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '"') {
+      const start = i;
+      i += 1;
+      let closed = false;
+      while (i < text.length) {
+        if (text[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (text[i] === '"') {
+          i += 1;
+          closed = true;
+          break;
+        }
+        i += 1;
+      }
+      if (!closed) return null;
+      out += text.slice(start, i);
+      continue;
+    }
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
+      i += 1;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+/**
+ * The number lexemes of a document, in order, ignoring anything inside a string.
+ *
+ * OUTSIDE STRINGS, AND POSITIONAL. The first version asked whether each
+ * rewritten lexeme still appeared ANYWHERE in the output, which a string
+ * containing the same text satisfies for free: in
+ * `{"n":1e3,"note":"value 1e3"}` the serialising fallback rewrites n to 1000,
+ * yet `1e3` survives inside the note, so a substring test reports the
+ * document unchanged and the result claims losslessness it does not have.
+ *
+ * The string-skipping here is deliberately the same shape as
+ * minifyPreservingTokens above: a span opened by a quote is consumed whole,
+ * with a backslash swallowing the character after it.
+ */
+function numberLexemes(text: string): string[] | null {
+  const found: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '"') {
+      i += 1;
+      let closed = false;
+      while (i < text.length) {
+        if (text[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (text[i] === '"') {
+          i += 1;
+          closed = true;
+          break;
+        }
+        i += 1;
+      }
+      // An unterminated string means the scan cannot be trusted; say so
+      // rather than returning a prefix that would compare as equal.
+      if (!closed) return null;
+      continue;
+    }
+    if (ch === '-' || (ch >= '0' && ch <= '9')) {
+      const start = i;
+      if (ch === '-') i += 1;
+      while (i < text.length && text[i] >= '0' && text[i] <= '9') i += 1;
+      if (text[i] === '.') {
+        i += 1;
+        while (i < text.length && text[i] >= '0' && text[i] <= '9') i += 1;
+      }
+      if (text[i] === 'e' || text[i] === 'E') {
+        i += 1;
+        if (text[i] === '+' || text[i] === '-') i += 1;
+        while (i < text.length && text[i] >= '0' && text[i] <= '9') i += 1;
+      }
+      found.push(text.slice(start, i));
+      continue;
+    }
+    i += 1;
+  }
+  return found;
+}
+
+/**
+ * Did every number survive as WRITTEN, not merely as valued?
+ *
+ * The runtime half of the guarantee. `minifyPreservingTokens` makes the
+ * common path safe by construction, but the serialising fallback still
+ * canonicalises, and a future edit could route more content through it. A
+ * claim of losslessness that nothing checks is how this defect shipped in the
+ * first place, so the claim is now conditioned on a check rather than on the
+ * author having remembered.
+ *
+ * Compared as SEQUENCES, position by position, so a rewrite cannot be masked
+ * by the same text appearing elsewhere in the document.
+ */
+function numbersKeptVerbatim(original: string, output: string): boolean {
+  const before = numberLexemes(original);
+  const after = numberLexemes(output);
+  if (before === null || after === null) return false;
+  if (before.length !== after.length) return false;
+  return before.every((lexeme, at) => lexeme === after[at]);
+}
 export function compressJson(
   text: string,
   ctx: EngineContext = {}
@@ -230,7 +365,7 @@ export function compressJson(
   }
   let parsed: unknown;
   let nestedElisions: readonly Elision[] = [];
-  // Set when a nested string was compressed lossily. Every `lossless: !nestedLossy`
+  // Set when a nested string was compressed lossily. Every `lossless: !nestedLossy && lexemeSafe`
   // return below is conditioned on it, because a document is only lossless if
   // its nested values were too.
   let nestedLossy = false;
@@ -288,10 +423,35 @@ export function compressJson(
 
   const elisions: Elision[] = [...nestedElisions];
 
+  // The lossless whole-array encoding, when one was worth computing.
+  // Compared against each candidate answer rather than against the first
+  // one that happened to be beaten.
+  let exact: CompressionResult | null = null;
+  // A KEYED MAP IS THE SAME REDUNDANCY AS AN ARRAY, and it was reaching
+  // minification at 20.8% because the array encoder requires Array.isArray.
+  // Route tables, per-host metrics and config-by-name are all written this
+  // way, so it is a common shape rather than an exotic one. Tried here as
+  // another candidate; `best` keeps whichever answer is smaller.
+  {
+    const asMap = compressJsonObjectMap(text);
+    if (asMap.text.length < text.length) exact = asMap;
+  }
+  /** Whichever is smaller: this answer, or the exact lossless encoding. */
+  const best = (candidate: CompressionResult): CompressionResult =>
+    exact && exact.text.length < candidate.text.length ? exact : candidate;
+
   // Null and absent are different values. Preserve nulls in visible and recovery data.
   const stripped = parsed;
 
-  const minified = JSON.stringify(stripped);
+  // The lexical scan is only equivalent when nothing restructured the
+  // document. A nested string that was compressed lives in `stripped` and
+  // not in `text`, so scanning the original would silently discard that
+  // work -- fall back to serialising in that case.
+  const scanned = nestedElisions.length ? null : minifyPreservingTokens(text);
+  const minified = scanned ?? JSON.stringify(stripped);
+  // Cheap on the scanned path, which cannot rewrite a number at all; the
+  // scan only runs when we fell back to serialising.
+  const lexemeSafe = scanned !== null || numbersKeptVerbatim(text, minified);
   // Whitespace is recorded only when there actually was some to remove.
   if (minified.length < text.length) {
     elisions.push({
@@ -337,8 +497,16 @@ export function compressJson(
       !categories.keep.size &&
       !nestedElisions.length
     ) {
-      const exact = compressJsonArray(text);
-      if (exact.text.length < minified.length * 0.7) return exact;
+      // HELD, NOT RETURNED. Returning here the moment the exact encoding
+      // beat MINIFIED compared it against the wrong alternative: further
+      // down, the row elision can put 85 of 90 rows in a spill and come out
+      // far smaller still. Measured, making the exact path reachable for
+      // one-line records took a block from 12.9% to 50.9% on its own and
+      // simultaneously took v3-history from 73.3% to 60.4% on the
+      // conversation, because the better lossless encoding preempted a much
+      // better lossy one. So the candidate is carried to every exit and the
+      // smaller answer wins there.
+      exact = compressJsonArray(text);
     }
     for (const i of categories.keep) keep.add(i);
     // 1. Content that a reader would come back for -- identifiers, failure
@@ -372,7 +540,11 @@ export function compressJson(
     if (dropped < tuning.minRowsToElide - tuning.keepRows) {
       // Almost everything is exceptional, so there is no redundant tail to
       // remove and eliding a handful of rows would not pay for the marker.
-      return { text: minified, elisions, lossless: !nestedLossy };
+      return best({
+        text: minified,
+        elisions,
+        lossless: !nestedLossy && lexemeSafe,
+      });
     }
 
     // NO HOME MEANS NO ELISION. Without a spill the rows would be gone with
@@ -380,8 +552,24 @@ export function compressJson(
     // no way back, which is the dangling-reference failure this design exists
     // to avoid. The minified document is still a real saving, so keep it and
     // keep the rows.
-    const recoverAt = spillFor(ctx, JSON.stringify(stripped), 'rows.json');
-    if (!recoverAt) return { text: minified, elisions, lossless: !nestedLossy };
+    // RE-SERIALISING THE PARSED ROWS IS NOT A RECOVERY. `1.0` parses to 1 and
+    // stringifies back as `1`, so a spill built from the values hands back a
+    // document the source never contained -- and the spill is the only place
+    // the dropped rows still exist. `scanned` is the same array with its
+    // whitespace removed and every lexeme as the source wrote it, so prefer
+    // it; it is null exactly when a nested string was compressed, and then the
+    // values are what survived and serialising them is the honest answer.
+    const recoverAt = spillFor(
+      ctx,
+      scanned ?? JSON.stringify(stripped),
+      'rows.json'
+    );
+    if (!recoverAt)
+      return best({
+        text: minified,
+        elisions,
+        lossless: !nestedLossy && lexemeSafe,
+      });
     const kept = [...keep].sort((a, b) => a - b).map((i) => stripped[i]);
     const sample = stripped.find((_row, i) => !keep.has(i));
     const keptText = JSON.stringify(kept);
@@ -400,7 +588,7 @@ export function compressJson(
         recoverAt
       ) +
       ']';
-    return {
+    return best({
       text: body,
       elisions: [
         ...elisions,
@@ -413,8 +601,12 @@ export function compressJson(
       // The repeating tail is gone from the text; only a spill makes it
       // recoverable, and even then it is a lookup rather than a reconstruction.
       lossless: false,
-    };
+    });
   }
 
-  return { text: minified, elisions, lossless: !nestedLossy };
+  return best({
+    text: minified,
+    elisions,
+    lossless: !nestedLossy && lexemeSafe,
+  });
 }
